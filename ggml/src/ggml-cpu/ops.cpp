@@ -3733,16 +3733,39 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
+    // NEON-accelerated sum-of-squares
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
                 ggml_float sum = 0.0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                {
+                    float32x4_t vsum0 = vdupq_n_f32(0.0f);
+                    float32x4_t vsum1 = vdupq_n_f32(0.0f);
+                    int64_t i00 = 0;
+                    for (; i00 + 15 < ne00; i00 += 16) {
+                        float32x4_t v0 = vld1q_f32(&x[i00]);
+                        float32x4_t v1 = vld1q_f32(&x[i00 + 4]);
+                        float32x4_t v2 = vld1q_f32(&x[i00 + 8]);
+                        float32x4_t v3 = vld1q_f32(&x[i00 + 12]);
+                        vsum0 = vmlaq_f32(vsum0, v0, v0);
+                        vsum1 = vmlaq_f32(vsum1, v1, v1);
+                        vsum0 = vmlaq_f32(vsum0, v2, v2);
+                        vsum1 = vmlaq_f32(vsum1, v3, v3);
+                    }
+                    vsum0 = vaddq_f32(vsum0, vsum1);
+                    sum = (ggml_float)vaddvq_f32(vsum0);
+                    for (; i00 < ne00; i00++) {
+                        sum += (ggml_float)(x[i00] * x[i00]);
+                    }
+                }
+#else
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
                 }
+#endif
 
                 const float mean = sum/ne00;
 
