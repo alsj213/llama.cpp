@@ -43,8 +43,9 @@ class LoraTorchTensor:
     _rank: int
 
     def __init__(self, A: Tensor, B: Tensor):
-        assert len(A.shape) == len(B.shape)
-        assert A.shape[-2] == B.shape[-1]
+        # the rank dim must match: A[-2] == B[-1]
+        assert A.shape[-2] == B.shape[-1], \
+            f"rank mismatch: A[-2]={A.shape[-2]}, B[-1]={B.shape[-1]}"
         if A.dtype != B.dtype:
             A = A.to(torch.float32)
             B = B.to(torch.float32)
@@ -120,7 +121,10 @@ class LoraTorchTensor:
 
     @property
     def shape(self) -> tuple[int, ...]:
-        assert len(self._lora_A.shape) == len(self._lora_B.shape)
+        # effective shape = B's leading dims [+ A's extra leading dims] + A's last dim.
+        n_diff = len(self._lora_A.shape) - len(self._lora_B.shape)
+        if n_diff > 0:
+            return (*self._lora_B.shape[:-1], *self._lora_A.shape[:n_diff], self._lora_A.shape[-1])
         return (*self._lora_B.shape[:-1], self._lora_A.shape[-1])
 
     def size(self, dim=None):
@@ -149,13 +153,47 @@ class LoraTorchTensor:
             assert n_elems % n_new_elems == 0
             new_shape = (*(dim if dim != -1 else n_elems // n_new_elems for dim in new_shape),)
 
-        if new_shape[-1] != orig_shape[-1]:
+        # find the split point k in new_shape where the leading dims match B's leading dims
+        # B "owns" the leading dimensions of the effective shape
+        orig_b_prod = 1
+        for d in self._lora_B.shape[:-1]:
+            orig_b_prod *= d
+
+        target = orig_b_prod
+        k = 0
+        cur = 1
+        while cur < target and k < len(new_shape) - 1:
+            cur *= new_shape[k]
+            k += 1
+
+        if cur != target:
             raise NotImplementedError  # can't reshape the row size trivially
 
-        shape_A = (*(1 for _ in new_shape[:-2]), self._rank, orig_shape[-1])
-        shape_B = (*new_shape[:-1], self._rank)
+        # B gets the leading dims, A gets the rest
+        shape_A = (*new_shape[k:-1], self._rank, new_shape[-1])
+        shape_B = (*new_shape[:k], self._rank)
+
+        # ensure the rank dim of A stays in the right C-contiguous position
+        # when extra dims are added or removed during the reshape
+        n_old_extra = len(self._lora_A.shape) - 2  # extra dims in current A
+        n_new_extra = max(0, len(shape_A) - 2)      # extra dims in target
+
+        if n_old_extra == n_new_extra:
+            A_final = self._lora_A.reshape(shape_A)
+        elif n_old_extra < n_new_extra:
+            # adding extra dims: reshape with rank first, then permute to target position
+            extra = new_shape[k:-1]
+            A_temp = self._lora_A.reshape(self._rank, *extra, new_shape[-1])
+            perm = list(range(1, n_new_extra + 1)) + [0] + list(range(n_new_extra + 1, len(shape_A)))
+            A_final = A_temp.permute(*perm)
+        else:
+            # removing extra dims: permute rank to front, then merge trailing dims
+            rank_pos = n_old_extra
+            perm = [rank_pos] + list(range(rank_pos)) + list(range(rank_pos + 1, len(self._lora_A.shape)))
+            A_final = self._lora_A.permute(*perm).reshape(shape_A)
+
         return LoraTorchTensor(
-            self._lora_A.reshape(shape_A),
+            A_final,
             self._lora_B.reshape(shape_B),
         )
 
@@ -168,10 +206,32 @@ class LoraTorchTensor:
     def permute(self, *dims: int) -> LoraTorchTensor:
         shape = self.shape
         dims = tuple(dim - len(shape) if dim >= 0 else dim for dim in dims)
+        n_b_leading = len(self._lora_B.shape) - 1  # B's leading dim count
+        n_extra_a  = len(self._lora_A.shape) - 2  # A's extra leading dim count
+
         if dims[-1] == -1:
-            # TODO: support higher dimensional A shapes bigger than 1
-            assert all(dim == 1 for dim in self._lora_A.shape[:-2])
-            return LoraTorchTensor(self._lora_A, self._lora_B.permute(*dims))
+            # last dim stays in place; permute B's leading dims and A's extra dims
+            if n_extra_a <= 0 or all(dim == 1 for dim in self._lora_A.shape[:-2]):
+                return LoraTorchTensor(self._lora_A, self._lora_B.permute(*dims))
+
+            # A has non-1 leading dims — permute both tensors
+            # dims are relative to len(shape); convert to per-tensor coordinates
+            n_diff = n_extra_a  # len(shape) - len(B)
+
+            a_perm = list(range(len(self._lora_A.shape)))
+            for i in range(n_extra_a):
+                dst = dims[n_b_leading + i]
+                a_perm[i] = dst - n_b_leading  # back to A's extra-dims space
+
+            b_perm = list(range(len(self._lora_B.shape)))
+            for i in range(n_b_leading):
+                dst = dims[i]
+                b_perm[i] = dst + n_diff if dst < 0 else dst - n_extra_a
+
+            return LoraTorchTensor(
+                self._lora_A.permute(*a_perm),
+                self._lora_B.permute(*b_perm),
+            )
         if len(shape) == 2 and dims[-1] == -2 and dims[-2] == -1:
             return LoraTorchTensor(self._lora_B.permute(*dims), self._lora_A.permute(*dims))
         else:
