@@ -9107,32 +9107,64 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     }
                 }
             }
+            bool kq_preprocessed = false;
             if (use_gemm_f16) {
                 memset(KQh, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(ggml_fp16_t));
                 simd_gemm_f16(KQh, Q_h, K_h, Q_TILE_SZ, DK, KV_TILE_SZ);
-                ggml_fp16_to_fp32_row(KQh, KQ, Q_TILE_SZ * KV_TILE_SZ);
+                if (logit_softcap == 0.0f && mask) {
+                    // fused single pass: f16->f32 + scale + mask add + pad -inf
+                    // (replaces four sweeps incl. two extra f32 round-trips)
+                    for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+                        float * kq_row = KQ + tq * KV_TILE_SZ;
+                        if (tq >= tile_rows) {
+                            // pad row: gemm zero row * scale + zero mask == 0
+                            memset(kq_row, 0, KV_TILE_SZ * sizeof(float));
+                        } else {
+                            const ggml_fp16_t * hrow = KQh + tq * KV_TILE_SZ;
+                            const float * mrow = mask32 + tq * KV_TILE_SZ;
+                            int tk = 0;
+#ifdef GGML_SIMD_GEMM_F16
+                            for (; tk + 4 <= kv_tile; tk += 4) {
+                                float32x4_t v = vcvt_f32_f16(vld1_f16((const __fp16 *)(hrow + tk)));
+                                vst1q_f32(kq_row + tk, vaddq_f32(vmulq_n_f32(v, scale), vld1q_f32(mrow + tk)));
+                            }
+#endif
+                            for (; tk < kv_tile; tk++) {
+                                kq_row[tk] = GGML_CPU_FP16_TO_FP32(hrow[tk]) * scale + mrow[tk];
+                            }
+                        }
+                        for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
+                            kq_row[tk] = -INFINITY;
+                        }
+                    }
+                    kq_preprocessed = true;
+                } else {
+                    ggml_fp16_to_fp32_row(KQh, KQ, Q_TILE_SZ * KV_TILE_SZ);
+                }
             } else {
                 memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
                 simd_gemm(KQ, (const float *)Q_q, K_f32, Q_TILE_SZ, DK, KV_TILE_SZ);
             }
-            ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, scale);
+            if (!kq_preprocessed) {
+                ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, scale);
 
-            // Set padded KQ entries to -inf so softmax gives them zero weight
-            if (kv_tile < KV_TILE_SZ) {
-                for (int tq = 0; tq < Q_TILE_SZ; tq++) {
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
+                // Set padded KQ entries to -inf so softmax gives them zero weight
+                if (kv_tile < KV_TILE_SZ) {
+                    for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+                        for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
+                            KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
+                        }
                     }
                 }
-            }
 
-            if (logit_softcap != 0.0f) {
-                ggml_vec_tanh_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, KQ);
-                ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, logit_softcap);
-            }
+                if (logit_softcap != 0.0f) {
+                    ggml_vec_tanh_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, KQ);
+                    ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, logit_softcap);
+                }
 
-            if (mask) {
-                ggml_vec_add_f32(tile_rows * KV_TILE_SZ, KQ, KQ, mask32);
+                if (mask) {
+                    ggml_vec_add_f32(tile_rows * KV_TILE_SZ, KQ, KQ, mask32);
+                }
             }
 
             bool skip[Q_TILE_SZ] = {};
@@ -9163,7 +9195,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 M[tq] = Mnew;
 
 
-                S[tq] += ggml_vec_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
+                if (use_gemm_f16) {
+                    // fused: exp lands in f16 KQh directly (no KQ f32 write + cvt re-read)
+                    S[tq] += ggml_vec_soft_max_f32_f16(KV_TILE_SZ, KQh + tq * KV_TILE_SZ, kq_row, Mnew);
+                } else {
+                    S[tq] += ggml_vec_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
+                }
             }
 
             // V accumulation: VKQ32 += softmax(KQ) * V
@@ -9179,11 +9216,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 }
             }
             if (use_gemm_f16) {
+                // softmax already wrote KQh (fused f16 output); only zero skip rows
                 for (int tq = 0; tq < Q_TILE_SZ; tq++) {
                     if (skip[tq]) {
                         memset(KQh + tq * KV_TILE_SZ, 0, KV_TILE_SZ * sizeof(ggml_fp16_t));
-                    } else {
-                        ggml_fp32_to_fp16_row(KQ + tq * KV_TILE_SZ, KQh + tq * KV_TILE_SZ, KV_TILE_SZ);
                     }
                 }
                 simd_gemm_f16(VKQh, KQh, V_h, Q_TILE_SZ, KV_TILE_SZ, DV);
