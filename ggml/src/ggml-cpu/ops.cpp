@@ -9266,11 +9266,19 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             const int i3 = iq3;
 
             if (use_gemm_f16) {
-                // fp16 accumulator -> f32 tail (KQ is dead here: reuse as tmp)
-                ggml_fp16_to_fp32_row(VKQh + tq * DV, KQ, DV);
-                ggml_vec_scale_f32(DV, KQ, S_inv);
-                // permute(0, 2, 1, 3)
-                memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, KQ, nb1);
+                // fused: f16->f32 + S_inv straight into dst (no tmp round-trip)
+                float * drow = (float *)((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1);
+                const ggml_fp16_t * vrow = VKQh + tq * DV;
+                int dv = 0;
+#ifdef GGML_SIMD_GEMM_F16
+                for (; dv + 4 <= DV; dv += 4) {
+                    float32x4_t v = vcvt_f32_f16(vld1_f16((const __fp16 *)(vrow + dv)));
+                    vst1q_f32(drow + dv, vmulq_n_f32(v, S_inv));
+                }
+#endif
+                for (; dv < DV; dv++) {
+                    drow[dv] = GGML_CPU_FP16_TO_FP32(vrow[dv]) * S_inv;
+                }
             } else {
                 ggml_vec_scale_f32(DV, VKQ32 + tq * DV, S_inv);
                 // permute(0, 2, 1, 3)
