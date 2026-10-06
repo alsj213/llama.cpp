@@ -252,18 +252,33 @@ static inline void simd_gemm16_ukernel(
         }
     }
 
-    for (int kk = 0; kk < K; kk++) {
+    // 2x unrolled k loop (runtime K leaves it uncollapsed otherwise);
+    // register peak: acc[RM][RN] + B0/B1 + 2 broadcasts = 26 of 32 for 4x4.
+    int kk = 0;
+    for (; kk + 2 <= K; kk += 2) {
+        float16x8_t B0[RN], B1[RN];
+        for (int r = 0; r < RN; r++) {
+            B0[r] = vld1q_f16((const __fp16 *)(B + kk * N + r * GEMM16_KN));
+            B1[r] = vld1q_f16((const __fp16 *)(B + (kk + 1) * N + r * GEMM16_KN));
+        }
+        for (int i = 0; i < RM; i++) {
+            const float16x8_t a0 = vdupq_n_f16(*(const __fp16 *)(A + i * K + kk));
+            const float16x8_t a1 = vdupq_n_f16(*(const __fp16 *)(A + i * K + kk + 1));
+            for (int r = 0; r < RN; r++) {
+                acc[i][r] = vfmaq_f16(acc[i][r], B0[r], a0);
+                acc[i][r] = vfmaq_f16(acc[i][r], B1[r], a1);
+            }
+        }
+    }
+    for (; kk < K; kk++) {
         float16x8_t Bv[RN];
         for (int r = 0; r < RN; r++) {
             Bv[r] = vld1q_f16((const __fp16 *)(B + kk * N + r * GEMM16_KN));
         }
-        float16x8_t av[RM];
         for (int i = 0; i < RM; i++) {
-            av[i] = vdupq_n_f16(*(const __fp16 *)(A + i * K + kk));
-        }
-        for (int i = 0; i < RM; i++) {
+            const float16x8_t av = vdupq_n_f16(*(const __fp16 *)(A + i * K + kk));
             for (int r = 0; r < RN; r++) {
-                acc[i][r] = vfmaq_f16(acc[i][r], Bv[r], av[i]);
+                acc[i][r] = vfmaq_f16(acc[i][r], Bv[r], av);
             }
         }
     }
