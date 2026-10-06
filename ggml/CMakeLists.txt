@@ -181,7 +181,7 @@ option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"      OFF)
 option(GGML_VXE              "ggml: enable vxe"               ${GGML_NATIVE})
 
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
-set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
+set(GGML_CPU_ARM_ARCH        "armv8.2-a+dotprod+fp16" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 
 # ggml core
