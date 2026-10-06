@@ -9046,7 +9046,49 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
-            for (int tk = 0; tk < kv_tile; tk++) {
+            int tk = 0;
+#ifdef GGML_SIMD_GEMM_F16
+            if (use_gemm_f16 && DK % 8 == 0) {
+                // fp16 channel: block-transpose in 8x8 f16 blocks (3-stage vtrn:
+                // 16/32/64-bit granularity, 24 instrs per 64 elems, contiguous
+                // stores). The scalar path scattered 2-byte stores 128B apart
+                // (~8192 stores/tile, one per cache line).
+                // Stage outputs land column-permuted: o[v] holds column perm[v].
+                static const int perm[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+                for (; tk + 8 <= kv_tile; tk += 8) {
+                    for (int64_t dk = 0; dk < DK; dk += 8) {
+                        float16x8_t r[8], t[8], u[8], o[8];
+                        for (int v = 0; v < 8; v++) {
+                            const char * row = (const char *)k->data + (ic + tk + v)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                            r[v] = vld1q_f16((const __fp16 *)((const ggml_fp16_t *)row + dk));
+                        }
+                        for (int v = 0; v < 8; v += 2) {                 // stage 1: 16-bit
+                            t[v]     = vtrn1q_f16(r[v], r[v + 1]);
+                            t[v + 1] = vtrn2q_f16(r[v], r[v + 1]);
+                        }
+                        // stage 2: 32-bit granularity, pairs (t0,t2)(t1,t3)(t4,t6)(t5,t7)
+                        u[0] = vreinterpretq_f16_f32(vtrn1q_f32(vreinterpretq_f32_f16(t[0]), vreinterpretq_f32_f16(t[2])));
+                        u[1] = vreinterpretq_f16_f32(vtrn2q_f32(vreinterpretq_f32_f16(t[0]), vreinterpretq_f32_f16(t[2])));
+                        u[2] = vreinterpretq_f16_f32(vtrn1q_f32(vreinterpretq_f32_f16(t[1]), vreinterpretq_f32_f16(t[3])));
+                        u[3] = vreinterpretq_f16_f32(vtrn2q_f32(vreinterpretq_f32_f16(t[1]), vreinterpretq_f32_f16(t[3])));
+                        u[4] = vreinterpretq_f16_f32(vtrn1q_f32(vreinterpretq_f32_f16(t[4]), vreinterpretq_f32_f16(t[6])));
+                        u[5] = vreinterpretq_f16_f32(vtrn2q_f32(vreinterpretq_f32_f16(t[4]), vreinterpretq_f32_f16(t[6])));
+                        u[6] = vreinterpretq_f16_f32(vtrn1q_f32(vreinterpretq_f32_f16(t[5]), vreinterpretq_f32_f16(t[7])));
+                        u[7] = vreinterpretq_f16_f32(vtrn2q_f32(vreinterpretq_f32_f16(t[5]), vreinterpretq_f32_f16(t[7])));
+                        for (int g = 0; g < 4; g++) {                    // stage 3: 64-bit
+                            float64x2_t a = vreinterpretq_f64_f16(u[g]);
+                            float64x2_t b = vreinterpretq_f64_f16(u[g + 4]);
+                            o[2*g]     = vreinterpretq_f16_f64(vtrn1q_f64(a, b));
+                            o[2*g + 1] = vreinterpretq_f16_f64(vtrn2q_f64(a, b));
+                        }
+                        for (int v = 0; v < 8; v++) {
+                            vst1q_f16((__fp16 *)(K_h + (dk + perm[v])*KV_TILE_SZ + tk), o[v]);
+                        }
+                    }
+                }
+            }
+#endif
+            for (; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
                 if (use_gemm_f16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
