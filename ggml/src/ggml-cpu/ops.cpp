@@ -8849,6 +8849,20 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     }
 }
 
+#ifdef GGML_SIMD_GEMM_F16
+// true ⇔ all 8 f16 lanes hold -INFINITY. -inf has exactly one f16 encoding
+// (0xFC00) and it is the only pattern that converts to -INFINITY, so an
+// integer equality compare is exact; unlike a vmax/vmin based test it also
+// rejects NaN lanes (which must not count as "masked out").
+static inline bool ggml_f16x8_all_neg_inf(uint16x8_t v) {
+    const uint16x8_t eq = vceqq_u16(v, vdupq_n_u16(0xfc00));
+    uint16x4_t r = vand_u16(vget_low_u16(eq), vget_high_u16(eq));
+    r = vand_u16(r, vext_u16(r, r, 2));
+    r = vand_u16(r, vext_u16(r, r, 1));
+    return vget_lane_u16(r, 0) == 0xffffu;
+}
+#endif
+
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8953,6 +8967,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         const uint32_t h = iq2; // head index
         const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
 
+        // fp16 fused-mask channel: with slope == 1 (no ALiBi) and no softcap the
+        // mask enters KQ unscaled, so it can be consumed as f16 directly — the
+        // mask32 materialization has no consumer on this path.
+        const bool mask_fused_f16 = use_gemm_f16 && mask != nullptr && logit_softcap == 0.0f && slope == 1.0f;
+
         float S[Q_TILE_SZ];
         float M[Q_TILE_SZ];
 
@@ -8987,7 +9006,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         ggml_fp16_t * KQh  = (ggml_fp16_t *) ((char *) VKQ32 + Q_TILE_SZ * DV * sizeof(ggml_fp16_t));
 
         memset(VKQ32, 0, Q_TILE_SZ * DV * sizeof(float));
-        memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
+        if (!mask_fused_f16) {
+            // mask32 is write-only on the fused f16 path (no fill, no reader)
+            memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
+        }
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -9025,17 +9047,43 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // skip the tile entirely if all the masks are -inf
             if (mask) {
                 bool can_skip = true;
-                for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
+                if (mask_fused_f16) {
+                    // Same test, but as a pure scan of the mask f16 — nothing is
+                    // materialized (the KQ pre-process pass reads the mask in
+                    // place). 8 lanes per iteration instead of per-element
+                    // ldrh/fcvt/fmul/str, and the scan exits on the first
+                    // non-masked lane.
+                    for (int tq = 0; tq < tile_rows && can_skip; tq++) {
+                        const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) + ic;
+                        int tk = 0;
+#ifdef GGML_SIMD_GEMM_F16
+                        for (; tk + 8 <= kv_tile; tk += 8) {
+                            if (!ggml_f16x8_all_neg_inf(vld1q_u16((const uint16_t *)(mp_row + tk)))) {
+                                can_skip = false;
+                                break;
+                            }
+                        }
+#endif
+                        for (; tk < kv_tile; tk++) {
+                            if (mp_row[tk] != (ggml_fp16_t) 0xfc00) {
+                                can_skip = false;
+                                break;
+                            }
                         }
                     }
-                    // Pad remaining mask entries with -inf
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
+                } else {
+                    for (int tq = 0; tq < tile_rows; tq++) {
+                        const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
+                        }
+                        // Pad remaining mask entries with -inf
+                        for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
+                        }
                     }
                 }
 
@@ -9114,11 +9162,28 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 if (logit_softcap == 0.0f && mask) {
                     // fused single pass: f16->f32 + scale + mask add + pad -inf
                     // (replaces four sweeps incl. two extra f32 round-trips)
+                    // mask_fused_f16: the mask is read as f16 right here instead
+                    // of being staged through mask32 (slope == 1.0f, so the
+                    // per-element slope multiply was an identity).
                     for (int tq = 0; tq < Q_TILE_SZ; tq++) {
                         float * kq_row = KQ + tq * KV_TILE_SZ;
                         if (tq >= tile_rows) {
                             // pad row: gemm zero row * scale + zero mask == 0
                             memset(kq_row, 0, KV_TILE_SZ * sizeof(float));
+                        } else if (mask_fused_f16) {
+                            const ggml_fp16_t * hrow = KQh + tq * KV_TILE_SZ;
+                            const ggml_fp16_t * mrow = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) + ic;
+                            int tk = 0;
+#ifdef GGML_SIMD_GEMM_F16
+                            for (; tk + 4 <= kv_tile; tk += 4) {
+                                float32x4_t v = vcvt_f32_f16(vld1_f16((const __fp16 *)(hrow + tk)));
+                                float32x4_t m = vcvt_f32_f16(vld1_f16((const __fp16 *)(mrow + tk)));
+                                vst1q_f32(kq_row + tk, vaddq_f32(vmulq_n_f32(v, scale), m));
+                            }
+#endif
+                            for (; tk < kv_tile; tk++) {
+                                kq_row[tk] = GGML_CPU_FP16_TO_FP32(hrow[tk]) * scale + GGML_CPU_FP16_TO_FP32(mrow[tk]);
+                            }
                         } else {
                             const ggml_fp16_t * hrow = KQh + tq * KV_TILE_SZ;
                             const float * mrow = mask32 + tq * KV_TILE_SZ;
