@@ -8940,6 +8940,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
+    // masked-tail clipping walks the q-tile as 16-row blocks
+    static constexpr int FA_CLIP_ROWS = 16;
+    static_assert(Q_TILE_SZ % FA_CLIP_ROWS == 0, "q tile must be a multiple of the clipped block height");
+
 #ifdef GGML_SIMD_GEMM_F16
     // fp16 GEMM channel (8-wide FMA on fullfp16 cores): K/V are F16 on this
     // path, and fp16 accumulation of KQ scores is upstream-consistent
@@ -8979,6 +8983,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             S[i] = 0.;
             M[i] = -INFINITY;
         }
+
+        // Masked-tail clipping bookkeeping (f16 fused-mask channel only):
+        // col_ub[tq] = last column of the tile that is not masked out for row
+        // tq (-1 if the row is masked over the whole tile), n_eff[s] = the
+        // KQ/VKQ width the s-th 16-row block actually needs.
+        int  col_ub[Q_TILE_SZ];
+        int  n_eff[Q_TILE_SZ/FA_CLIP_ROWS];
+        bool clip = false;
 
         // Per-thread scratch layout:
         // Q_q:    Q_TILE_SZ * DK (converted Q tile — F32 for GEMM, KV type for scalar)
@@ -9043,6 +9055,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
+            clip = false;
+            for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+                col_ub[tq] = kv_tile - 1; // fully visible (nothing to clip)
+            }
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
@@ -9051,24 +9067,45 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     // Same test, but as a pure scan of the mask f16 — nothing is
                     // materialized (the KQ pre-process pass reads the mask in
                     // place). 8 lanes per iteration instead of per-element
-                    // ldrh/fcvt/fmul/str, and the scan exits on the first
-                    // non-masked lane.
-                    for (int tq = 0; tq < tile_rows && can_skip; tq++) {
+                    // ldrh/fcvt/fmul/str.
+                    //
+                    // Descending scan: the columns past col_ub are all -inf, so
+                    // the scan descends to the last non-masked column and stops
+                    // there (a fully visible row stops on the very first
+                    // group, a fully masked one walks the whole row — the same
+                    // cost the ascending scan had). can_skip ⇔ every valid row
+                    // is masked over the whole tile.
+                    for (int tq = 0; tq < tile_rows; tq++) {
                         const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) + ic;
-                        int tk = 0;
+                        int tk = kv_tile;
+                        int ub = -1;
 #ifdef GGML_SIMD_GEMM_F16
-                        for (; tk + 8 <= kv_tile; tk += 8) {
-                            if (!ggml_f16x8_all_neg_inf(vld1q_u16((const uint16_t *)(mp_row + tk)))) {
-                                can_skip = false;
-                                break;
+                        for (; tk - 8 >= 0; tk -= 8) {
+                            if (ggml_f16x8_all_neg_inf(vld1q_u16((const uint16_t *)(mp_row + tk - 8)))) {
+                                continue;
                             }
+                            // first group holding a visible lane: re-scan its
+                            // 8 entries scalar to pin the exact last column
+                            for (int l = 7; l >= 0; l--) {
+                                if (mp_row[tk - 8 + l] != (ggml_fp16_t) 0xfc00) {
+                                    ub = tk - 8 + l;
+                                    break;
+                                }
+                            }
+                            break;
                         }
 #endif
-                        for (; tk < kv_tile; tk++) {
-                            if (mp_row[tk] != (ggml_fp16_t) 0xfc00) {
-                                can_skip = false;
-                                break;
+                        if (ub < 0) {
+                            for (; tk > 0; tk--) {
+                                if (mp_row[tk - 1] != (ggml_fp16_t) 0xfc00) {
+                                    ub = tk - 1;
+                                    break;
+                                }
                             }
+                        }
+                        col_ub[tq] = ub;
+                        if (ub >= 0) {
+                            can_skip = false;
                         }
                     }
                 } else {
@@ -9092,7 +9129,31 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 }
             }
 
-            // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
+            // Columns the KQ/VKQ GEMMs actually have to cover, per 16-row
+            // block: everything past the block's last visible column is
+            // masked out, so those FMA are dead work. 8-column granularity
+            // (the ukernel's lane width); a block whose rows are all fully
+            // visible keeps the full tile width, which makes the clipped and
+            // the plain path identical there. Only worth it when at least one
+            // block is actually clipped.
+            if (mask_fused_f16) {
+                for (int s = 0; s < Q_TILE_SZ/FA_CLIP_ROWS; s++) {
+                    const int r0 = s*FA_CLIP_ROWS;
+                    const int r1 = MIN(r0 + FA_CLIP_ROWS, tile_rows);
+                    if (r0 >= r1) {
+                        n_eff[s] = kv_tile; // no valid row in this block
+                        continue;
+                    }
+                    int cmax = -1;
+                    for (int tq = r0; tq < r1; tq++) {
+                        cmax = MAX(cmax, col_ub[tq]);
+                    }
+                    n_eff[s] = MIN((cmax + 1 + 7) & ~7, kv_tile);
+                    if (n_eff[s] < kv_tile) {
+                        clip = true;
+                    }
+                }
+            }
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             int tk = 0;
 #ifdef GGML_SIMD_GEMM_F16
@@ -9158,7 +9219,21 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             bool kq_preprocessed = false;
             if (use_gemm_f16) {
                 memset(KQh, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(ggml_fp16_t));
-                simd_gemm_f16(KQh, Q_h, K_h, Q_TILE_SZ, DK, KV_TILE_SZ);
+                if (clip) {
+                    // one GEMM per 16-row block, over [0, n_eff[s]) columns.
+                    // K (packed with a KV_TILE_SZ pitch) and KQh are wider
+                    // than N here — hence the explicit lda/ldb/ldc.
+                    for (int s = 0; s < Q_TILE_SZ/FA_CLIP_ROWS; s++) {
+                        if (n_eff[s] <= 0) {
+                            continue; // every lane of the block is masked out
+                        }
+                        simd_gemm_f16(KQh + s*FA_CLIP_ROWS*KV_TILE_SZ, Q_h + s*FA_CLIP_ROWS*(int) DK, K_h,
+                                      FA_CLIP_ROWS, (int) DK, n_eff[s],
+                                      (int) DK, KV_TILE_SZ, KV_TILE_SZ);
+                    }
+                } else {
+                    simd_gemm_f16(KQh, Q_h, K_h, Q_TILE_SZ, DK, KV_TILE_SZ);
+                }
                 if (logit_softcap == 0.0f && mask) {
                     // fused single pass: f16->f32 + scale + mask add + pad -inf
                     // (replaces four sweeps incl. two extra f32 round-trips)
@@ -9167,6 +9242,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     // per-element slope multiply was an identity).
                     for (int tq = 0; tq < Q_TILE_SZ; tq++) {
                         float * kq_row = KQ + tq * KV_TILE_SZ;
+                        // Clipped width for this row: every column >= ub is
+                        // masked out, so KQh holds nothing useful there — the
+                        // fill below writes them flat -inf instead, which is
+                        // exactly what the (never read) score + mask would
+                        // have produced.
+                        const int ub = (clip && tq < tile_rows) ? col_ub[tq] + 1 : kv_tile;
                         if (tq >= tile_rows) {
                             // pad row: gemm zero row * scale + zero mask == 0
                             memset(kq_row, 0, KV_TILE_SZ * sizeof(float));
@@ -9175,13 +9256,13 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                             const ggml_fp16_t * mrow = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) + ic;
                             int tk = 0;
 #ifdef GGML_SIMD_GEMM_F16
-                            for (; tk + 4 <= kv_tile; tk += 4) {
+                            for (; tk + 4 <= ub; tk += 4) {
                                 float32x4_t v = vcvt_f32_f16(vld1_f16((const __fp16 *)(hrow + tk)));
                                 float32x4_t m = vcvt_f32_f16(vld1_f16((const __fp16 *)(mrow + tk)));
                                 vst1q_f32(kq_row + tk, vaddq_f32(vmulq_n_f32(v, scale), m));
                             }
 #endif
-                            for (; tk < kv_tile; tk++) {
+                            for (; tk < ub; tk++) {
                                 kq_row[tk] = GGML_CPU_FP16_TO_FP32(hrow[tk]) * scale + GGML_CPU_FP16_TO_FP32(mrow[tk]);
                             }
                         } else {
@@ -9198,7 +9279,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                                 kq_row[tk] = GGML_CPU_FP16_TO_FP32(hrow[tk]) * scale + mrow[tk];
                             }
                         }
-                        for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
+                        for (int tk = ub; tk < KV_TILE_SZ; tk++) {
                             kq_row[tk] = -INFINITY;
                         }
                     }
@@ -9287,7 +9368,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         memset(KQh + tq * KV_TILE_SZ, 0, KV_TILE_SZ * sizeof(ggml_fp16_t));
                     }
                 }
-                simd_gemm_f16(VKQh, KQh, V_h, Q_TILE_SZ, KV_TILE_SZ, DV);
+                if (clip) {
+                    // same 16-row blocks, K dimension clipped to n_eff[s]:
+                    // KQh holds exp(-inf) == 0 past the block bound, so the
+                    // dropped products are exactly zero. KQh rows are packed
+                    // with a KV_TILE_SZ pitch (lda), V_h/VKQh are dense.
+                    for (int s = 0; s < Q_TILE_SZ/FA_CLIP_ROWS; s++) {
+                        if (n_eff[s] <= 0) {
+                            continue; // nothing to accumulate for this block
+                        }
+                        simd_gemm_f16(VKQh + s*FA_CLIP_ROWS*(int) DV, KQh + s*FA_CLIP_ROWS*KV_TILE_SZ, V_h,
+                                      FA_CLIP_ROWS, n_eff[s], (int) DV,
+                                      KV_TILE_SZ, (int) DV, (int) DV);
+                    }
+                } else {
+                    simd_gemm_f16(VKQh, KQh, V_h, Q_TILE_SZ, KV_TILE_SZ, DV);
+                }
             } else {
                 for (int tq = 0; tq < Q_TILE_SZ; tq++) {
                     if (skip[tq]) {
