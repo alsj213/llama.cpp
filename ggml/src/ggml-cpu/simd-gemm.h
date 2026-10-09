@@ -238,28 +238,31 @@ static constexpr int GEMM16_RM = 4;
 static constexpr int GEMM16_RN = 4;
 static constexpr int GEMM16_KN = 8;
 
+// Row pitches are explicit: the flash-attn tiled path also runs clipped
+// GEMMs, where the C/B/A row stride differs from N/K (the K tile / KQh are
+// packed with a KV_TILE_SZ pitch while N is the clipped column count).
 template <int RM, int RN>
 static inline void simd_gemm16_ukernel(
     ggml_fp16_t       * GGML_RESTRICT C,
     const ggml_fp16_t * GGML_RESTRICT A,
     const ggml_fp16_t * GGML_RESTRICT B,
-    int K, int N)
+    int K, int lda, int ldb, int ldc)
 {
     float16x8_t acc[RM][RN];
     for (int i = 0; i < RM; i++) {
         for (int r = 0; r < RN; r++) {
-            acc[i][r] = vld1q_f16((const __fp16 *)(C + i * N + r * GEMM16_KN));
+            acc[i][r] = vld1q_f16((const __fp16 *)(C + i * ldc + r * GEMM16_KN));
         }
     }
 
     for (int kk = 0; kk < K; kk++) {
         float16x8_t Bv[RN];
         for (int r = 0; r < RN; r++) {
-            Bv[r] = vld1q_f16((const __fp16 *)(B + kk * N + r * GEMM16_KN));
+            Bv[r] = vld1q_f16((const __fp16 *)(B + kk * ldb + r * GEMM16_KN));
         }
         float16x8_t av[RM];
         for (int i = 0; i < RM; i++) {
-            av[i] = vdupq_n_f16(*(const __fp16 *)(A + i * K + kk));
+            av[i] = vdupq_n_f16(*(const __fp16 *)(A + i * lda + kk));
         }
         for (int i = 0; i < RM; i++) {
             for (int r = 0; r < RN; r++) {
@@ -270,60 +273,66 @@ static inline void simd_gemm16_ukernel(
 
     for (int i = 0; i < RM; i++) {
         for (int r = 0; r < RN; r++) {
-            vst1q_f16((__fp16 *)(C + i * N + r * GEMM16_KN), acc[i][r]);
+            vst1q_f16((__fp16 *)(C + i * ldc + r * GEMM16_KN), acc[i][r]);
         }
     }
 }
 
 // C[M x N] += A[M x K] * B[K x N]   (all fp16)
+// lda/ldb/ldc are the A/B/C row pitches in elements; <= 0 selects the dense
+// pitch (K/N/N), which is what every dense caller wants.
 static void simd_gemm_f16(
     ggml_fp16_t       * GGML_RESTRICT C,
     const ggml_fp16_t * GGML_RESTRICT A,
     const ggml_fp16_t * GGML_RESTRICT B,
-    int M, int K, int N)
+    int M, int K, int N, int lda = -1, int ldb = -1, int ldc = -1)
 {
+    if (lda <= 0) { lda = K; }
+    if (ldb <= 0) { ldb = N; }
+    if (ldc <= 0) { ldc = N; }
+
     int64_t ii = 0;
     for (; ii + GEMM16_RM <= M; ii += GEMM16_RM) {
         int64_t jj = 0;
         for (; jj + GEMM16_RN * GEMM16_KN <= N; jj += GEMM16_RN * GEMM16_KN) {
-            simd_gemm16_ukernel<GEMM16_RM, GEMM16_RN>(C + jj, A, B + jj, K, N);
+            simd_gemm16_ukernel<GEMM16_RM, GEMM16_RN>(C + jj, A, B + jj, K, lda, ldb, ldc);
         }
         for (; jj + GEMM16_KN <= N; jj += GEMM16_KN) {
-            simd_gemm16_ukernel<GEMM16_RM, 1>(C + jj, A, B + jj, K, N);
+            simd_gemm16_ukernel<GEMM16_RM, 1>(C + jj, A, B + jj, K, lda, ldb, ldc);
         }
         for (; jj < N; jj++) {
             for (int i = 0; i < GEMM16_RM; i++) {
-                float a = GGML_FP16_TO_FP32(C[i * N + jj]);
+                float a = GGML_FP16_TO_FP32(C[i * ldc + jj]);
                 for (int kk = 0; kk < K; kk++) {
-                    a += GGML_FP16_TO_FP32(A[i * K + kk]) * GGML_FP16_TO_FP32(B[kk * N + jj]);
+                    a += GGML_FP16_TO_FP32(A[i * lda + kk]) * GGML_FP16_TO_FP32(B[kk * ldb + jj]);
                 }
-                C[i * N + jj] = GGML_FP32_TO_FP16(a);
+                C[i * ldc + jj] = GGML_FP32_TO_FP16(a);
             }
         }
 
-        A += GEMM16_RM * K;
-        C += GEMM16_RM * N;
+        A += GEMM16_RM * lda;
+        C += GEMM16_RM * ldc;
     }
 
     // Tail rows: one at a time
     for (; ii < M; ii++) {
         int64_t jj = 0;
         for (; jj + GEMM16_RN * GEMM16_KN <= N; jj += GEMM16_RN * GEMM16_KN) {
-            simd_gemm16_ukernel<1, GEMM16_RN>(C + jj, A, B + jj, K, N);
+            simd_gemm16_ukernel<1, GEMM16_RN>(C + jj, A, B + jj, K, lda, ldb, ldc);
         }
         for (; jj + GEMM16_KN <= N; jj += GEMM16_KN) {
-            simd_gemm16_ukernel<1, 1>(C + jj, A, B + jj, K, N);
+            simd_gemm16_ukernel<1, 1>(C + jj, A, B + jj, K, lda, ldb, ldc);
         }
         for (; jj < N; jj++) {
             float a = GGML_FP16_TO_FP32(C[jj]);
             for (int kk = 0; kk < K; kk++) {
-                a += GGML_FP16_TO_FP32(A[kk]) * GGML_FP16_TO_FP32(B[kk * N + jj]);
+                a += GGML_FP16_TO_FP32(A[kk]) * GGML_FP16_TO_FP32(B[kk * ldb + jj]);
             }
             C[jj] = GGML_FP32_TO_FP16(a);
         }
 
-        A += K;
-        C += N;
+        A += lda;
+        C += ldc;
     }
 }
 #else
@@ -334,15 +343,19 @@ static void simd_gemm_f16(
     ggml_fp16_t       * GGML_RESTRICT C,
     const ggml_fp16_t * GGML_RESTRICT A,
     const ggml_fp16_t * GGML_RESTRICT B,
-    int M, int K, int N)
+    int M, int K, int N, int lda = -1, int ldb = -1, int ldc = -1)
 {
+    if (lda <= 0) { lda = K; }
+    if (ldb <= 0) { ldb = N; }
+    if (ldc <= 0) { ldc = N; }
+
     for (int64_t i = 0; i < M; i++) {
         for (int64_t j = 0; j < N; j++) {
-            float sum = GGML_FP16_TO_FP32(C[i * N + j]);
+            float sum = GGML_FP16_TO_FP32(C[i * ldc + j]);
             for (int64_t kk = 0; kk < K; kk++) {
-                sum += GGML_FP16_TO_FP32(A[i * K + kk]) * GGML_FP16_TO_FP32(B[kk * N + j]);
+                sum += GGML_FP16_TO_FP32(A[i * lda + kk]) * GGML_FP16_TO_FP32(B[kk * ldb + j]);
             }
-            C[i * N + j] = GGML_FP32_TO_FP16(sum);
+            C[i * ldc + j] = GGML_FP32_TO_FP16(sum);
         }
     }
 }
