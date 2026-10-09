@@ -4318,6 +4318,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
         int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
 
+        // Cap the chunk height by the L1 footprint of the weight slice it streams.
+        //
+        // The gemm kernel consumes src1 in INTER_SIZE(=4)-token steps and re-scans the whole
+        // weight slice of its chunk for every step, i.e. nrows/4 times. The geometry above
+        // derives rows-per-chunk from the thread count alone, so the slice footprint grows
+        // with K and differs several-fold across nodes (q/k/v/o ~576 B/row vs down ~2520
+        // B/row) - with a fixed row count, the FFN slices end up well past L1d and every
+        // re-scan is served from L2. Bound the slice to L1_WEIGHT_BUDGET_BYTES instead and
+        // let nchunk0 grow to match; nchunk0 only ever grows here, so the NB_COLS alignment,
+        // the one-chunk-per-thread floor and the dynamic chunk claiming below are untouched.
+        {
+            // A77-class L1d is 64 KiB; leave room for the q8_K activation operand and the
+            // fp32 accumulator tile that share it.
+            constexpr int64_t L1_WEIGHT_BUDGET_BYTES = 32 * 1024;
+            const int64_t     row_bytes = (int64_t) nb01;  // bytes per weight row (= ggml_row_size(src0->type, ne00))
+            if (row_bytes > 0 && nr0 >= NB_COLS) {
+                int64_t dr0_max = (L1_WEIGHT_BUDGET_BYTES + row_bytes - 1) / row_bytes;  // budget expressed in rows
+                dr0_max = ((dr0_max + NB_COLS - 1) / NB_COLS) * NB_COLS;                 // round up to a whole NB_COLS group
+                dr0_max = MIN(dr0_max, (nr0 + nth - 1) / nth);                           // keep at least one chunk per thread
+                dr0_max = MAX(dr0_max, NB_COLS);                                         // never below the alignment floor
+                nchunk0 = MAX(nchunk0, (nr0 + dr0_max - 1) / dr0_max);
+            }
+        }
+
         // src1 is chunked only by full planes.
         // When we flatten we need to address dimensions not multiple of the q8 INTER_SIZE
         // to route them thorugh GEMV.
