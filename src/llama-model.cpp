@@ -2697,10 +2697,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams,
                                 params.type_k,
                                 params.type_v,
-                                // engopt kv-decode-deep r5: V-cache 固定用转置（非 FA）布局——
+                                // engopt kv-decode-deep r5: V-cache 用转置（非 FA）布局——
                                 // 深 KV decode 走非 FA 链时免 cont(transpose(v)) 全量拷贝；
                                 // FA 侧（prefill/浅 KV）做 per-batch 一次性 repack（见 llama-graph.cpp）。
-                                true,
+                                // engopt fix: 量化 V（q8_0/q4_0 等）回退 pre-R5 布局——转置存储下
+                                // FA 侧 repack 落到 dup_bytes（ggml-cpu/ops.cpp）的量化行宽错误
+                                // （rs = ne00 * type_size 假定 type_size=每元素宽），静默错拷。
+                                // 量化时 v_trans=false 即 pre-R5 的 FA 布局（量化 KV 本就被 R5
+                                // 非 FA 路由的 f16 门排除，见 llama-graph.cpp build_attn_mha）。
+                                !ggml_is_quantized(params.type_v),
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
