@@ -194,6 +194,60 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // R3：滚动 eviction 模拟——每步用最近 W 步窗口重选 top-25%，叠加 recency 保留；
+    // 统计"被淘汰位置"在每步分布中的质量损失（工程版策略的每步损失率）。
+    {
+        const int64_t W = 16;
+        const double keep_frac = 0.25;
+        const int64_t n_steps = (int64_t) ud.step_dist.size();
+        double loss_sum = 0.0, mass_sum = 0.0;
+        int64_t n_eval = 0;
+        for (int64_t t = W; t < n_steps; t++) {
+            const auto & dt = ud.step_dist[t];
+            const int64_t n = (int64_t) dt.size();
+            // 有效末位（未来槽被 mask 为 0）
+            int64_t last = n - 1;
+            while (last > 0 && dt[last] <= 0.0) {
+                last--;
+            }
+            // 观察窗累计（最近 W 步）
+            std::vector<double> win(n, 0.0);
+            for (int64_t u = t - W; u < t; u++) {
+                const auto & du = ud.step_dist[u];
+                const int64_t m = std::min<int64_t>(n, (int64_t) du.size());
+                for (int64_t i = 0; i < m; i++) {
+                    win[i] += du[i];
+                }
+            }
+            const int64_t k = std::max<int64_t>(1, (int64_t) (n * keep_frac));
+            std::vector<int64_t> idx(n);
+            for (int64_t i = 0; i < n; i++) {
+                idx[i] = i;
+            }
+            std::sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return win[a] > win[b]; });
+            std::vector<char> keep(n, 0);
+            for (int64_t i = 0; i < k; i++) {
+                keep[idx[i]] = 1;
+            }
+            for (int64_t i = std::max<int64_t>(0, last - W + 1); i <= last; i++) {
+                keep[i] = 1;   // recency（最后 W 个有效位置）
+            }
+            double tot = 0.0, lost = 0.0;
+            for (int64_t i = 0; i <= last; i++) {
+                tot += dt[i];
+                if (!keep[i]) {
+                    lost += dt[i];
+                }
+            }
+            loss_sum += lost;
+            mass_sum += tot;
+            n_eval++;
+        }
+        LOG_INF("R3 rolling (W=%lld, keep=%.0f%% + recency): avg per-step lost mass = %.4f (over %lld steps)\n",
+                (long long) W, keep_frac * 100.0,
+                mass_sum > 0 ? loss_sum / mass_sum : 0.0, (long long) n_eval);
+    }
+
     LOG("\n");
     llama_perf_context_print(ctx);
     llama_backend_free();
