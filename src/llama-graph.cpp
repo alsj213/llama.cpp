@@ -35,8 +35,15 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // engopt kv-decode-deep r5: 掩码类型跟随本图实际注意力链——与 build_attn_mha
+    // 的 use_non_fa_deep_decode 判定严格一致：f16 KV 单 token 且 n_kv≥128 → 非 FA
+    // 链（f32 掩码）；其余（prefill/浅 KV）走 FA（f16 掩码）。
+    const bool non_fa_decode =
+        mctx->type_k() == GGML_TYPE_F16 &&
+        mctx->type_v() == GGML_TYPE_F16 &&
+        n_tokens/n_stream == 1 &&
+        n_kv >= 128;
+    const auto type = (cparams.flash_attn && !non_fa_decode) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
@@ -2552,6 +2559,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
+    // engopt kv-decode-deep r5: 深 KV 的单 token decode 改走非 FA 链（mul_mat/
+    // tinyBLAS 块式 gemm；实测 t4 d4096 6.66→15.6 t/s）。n_kv<128 的浅 decode 与
+    // prefill 保持 FA（d0 型短生成零变化；tg512 起非 FA 实测 +7.2%）。
+    // KV 视图维度（llama-kv-cache.cpp:get_k）：ne = [dk, kv_heads, n_kv, stream]。
+    const bool use_non_fa_deep_decode =
+        k->type == GGML_TYPE_F16 &&
+        v->type == GGML_TYPE_F16 &&
+        q->ne[2] / n_stream == 1 &&
+        k->ne[2] >= 128;
+
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
@@ -2560,12 +2577,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !use_non_fa_deep_decode;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
         if (v_trans) {
-            v = ggml_transpose(ctx0, v);
+            // engopt kv-decode-deep r5: 缓存为转置（非 FA）布局时，FA 需物化
+            // [dv, n_kv, heads]（每 batch 每层一次 repack，摊薄到整个 batch；
+            // 裸 transpose 视图首维步长 ≠ 元素大小，过不了 FA op 入口断言）。
+            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)

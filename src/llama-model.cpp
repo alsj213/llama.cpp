@@ -2697,7 +2697,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn,
+                                // engopt kv-decode-deep r5: V-cache 固定用转置（非 FA）布局——
+                                // 深 KV decode 走非 FA 链时免 cont(transpose(v)) 全量拷贝；
+                                // FA 侧（prefill/浅 KV）做 per-batch 一次性 repack（见 llama-graph.cpp）。
+                                true,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
