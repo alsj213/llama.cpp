@@ -40,7 +40,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // 链（f32 掩码）；其余（prefill/浅 KV）走 FA（f16 掩码）。
     // （r1 扩门：M==1 → M<64，与 build_attn_mha 同步。）
     const bool non_fa_decode =
-        mctx->type_k() == GGML_TYPE_F16 &&
+        (mctx->type_k() == GGML_TYPE_F16 || ggml_is_quantized(mctx->type_k())) &&
         mctx->type_v() == GGML_TYPE_F16 &&
         n_tokens/n_stream < 64 &&
         n_kv >= 128;
@@ -2568,8 +2568,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // one_chunk 慢路径（实测 PLD verify batch 每步 ~210ms 固定税，nd1=6.6x 单
     // token 步）；非 FA 链走 mul_mat(V)，对任意 M 天然 batch 复用（KV 读一次 +
     // gemm M 行）。M>=64 留给 tiled FA（neq1>=Q_TILE 即启用），互补不重叠。
+    // engopt q8k-non-fa-verify r1: K 维度放开量化（q8_0 等）——量化 K 的
+    // kv 视图由 get_k 以 ggml_row_size 构造（块感知），非 FA 的 mul_mat
+    // (q8_0 K x f32 q) 是标准 vec_dot；V 保 f16（量化 V 的布局/dup 面未开，
+    // 见 3716cc01b 与 dup_bytes 行宽问题）。f16 子集行为不变。
     const bool use_non_fa_deep_decode =
-        k->type == GGML_TYPE_F16 &&
+        (k->type == GGML_TYPE_F16 || ggml_is_quantized(k->type)) &&
         v->type == GGML_TYPE_F16 &&
         q->ne[2] / n_stream < 64 &&
         k->ne[2] >= 128;
