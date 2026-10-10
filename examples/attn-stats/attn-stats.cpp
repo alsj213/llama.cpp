@@ -18,6 +18,7 @@
 
 struct attn_stats {
     std::vector<double> acc;   // [n_kv] 全局累计（跨层/步/head）
+    std::vector<std::vector<double>> step_dist;   // [step] -> [pos]，该步分布（层/head 合并）
     int64_t n_captured = 0;
     int64_t n_kv_max   = 0;
 };
@@ -38,6 +39,13 @@ static bool attn_stats_cb(struct ggml_tensor * t, bool ask, void * ud_) {
     if ((int64_t) ud->acc.size() < n_kv) {
         ud->acc.resize(n_kv, 0.0);
     }
+    if (ud->step_dist.empty()) {
+        ud->step_dist.push_back({});
+    }
+    auto & sd = ud->step_dist.back();
+    if ((int64_t) sd.size() < n_kv) {
+        sd.resize(n_kv, 0.0);
+    }
 
     const float * p = buf.data();
     for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
@@ -45,6 +53,7 @@ static bool attn_stats_cb(struct ggml_tensor * t, bool ask, void * ud_) {
             for (int64_t q = 0; q < n_q; q++) {
                 for (int64_t i = 0; i < n_kv; i++) {
                     ud->acc[i] += p[i];
+                    sd[i]      += p[i];
                 }
                 p += n_kv;
             }
@@ -108,6 +117,7 @@ int main(int argc, char ** argv) {
         if (llama_vocab_is_eog(vocab, id)) {
             break;
         }
+        ud.step_dist.push_back({});
         if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
             LOG_ERR("%s : decode failed at step %d\n", __func__, i);
             break;
@@ -135,6 +145,52 @@ int main(int argc, char ** argv) {
             for (int64_t i = 0; i < k; i++) s += v[i];
             LOG_INF("top %5.1f%% (%6lld pos): mass share = %.4f\n",
                     pct, (long long) k, total > 0 ? s / total : 0.0);
+        }
+    }
+
+    // R2：因果版——观察窗（前 s 步）选出的 top-25% 位置，在未来（s..end）同域内的质量保留
+    {
+        const int64_t n_steps = (int64_t) ud.step_dist.size();
+        LOG_INF("\n=== window prediction (causal) ===\n");
+        for (int64_t s : { (int64_t) 16, (int64_t) 32, (int64_t) 48 }) {
+            if (s >= n_steps) {
+                continue;
+            }
+            std::vector<double> obs, fut;
+            for (int64_t t = 0; t < s; t++) {
+                const auto & d = ud.step_dist[t];
+                if ((int64_t) obs.size() < (int64_t) d.size()) obs.resize(d.size(), 0.0);
+                for (size_t i = 0; i < d.size(); i++) obs[i] += d[i];
+            }
+            for (int64_t t = s; t < n_steps; t++) {
+                const auto & d = ud.step_dist[t];
+                if ((int64_t) fut.size() < (int64_t) d.size()) fut.resize(d.size(), 0.0);
+                for (size_t i = 0; i < d.size(); i++) fut[i] += d[i];
+            }
+            const int64_t n = (int64_t) obs.size();
+            const int64_t k = std::max<int64_t>(1, (int64_t) (n * 0.25));
+            std::vector<int64_t> idx(n);
+            for (int64_t i = 0; i < n; i++) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return obs[a] > obs[b]; });
+            std::vector<char> sel(n, 0);
+            for (int64_t i = 0; i < k; i++) sel[idx[i]] = 1;
+
+            const int64_t lim = std::min<int64_t>(n, (int64_t) fut.size());
+            double m_sel = 0.0, m_tot = 0.0;
+            for (int64_t i = 0; i < lim; i++) {
+                if (sel[i]) m_sel += fut[i];
+                m_tot += fut[i];
+            }
+            // oracle：未来同域内的 top-k 占比
+            std::vector<double> fv(fut.begin(), fut.begin() + lim);
+            std::sort(fv.begin(), fv.end(), std::greater<double>());
+            double fo = 0.0;
+            for (int64_t i = 0; i < std::min<int64_t>(k, lim); i++) fo += fv[i];
+
+            LOG_INF("obs=%lld steps, n=%lld: selected-25%% future-mass=%.4f | oracle-top25%%=%.4f\n",
+                    (long long) s, (long long) n,
+                    m_tot > 0 ? m_sel / m_tot : 0.0,
+                    m_tot > 0 ? fo / m_tot : 0.0);
         }
     }
 
