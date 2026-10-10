@@ -2572,6 +2572,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // kv 视图由 get_k 以 ggml_row_size 构造（块感知），非 FA 的 mul_mat
     // (q8_0 K x f32 q) 是标准 vec_dot；V 保 f16（量化 V 的布局/dup 面未开，
     // 见 3716cc01b 与 dup_bytes 行宽问题）。f16 子集行为不变。
+    // [q8kv r1 否证] V 量化（v_trans=false + 非 FA 兜底 transpose）不可行：
+    // 转置量化视图 ne0=n_kv 非 32 块对齐，dup/读取几何破裂（accept 0% + 4x 慢，
+    // 见 night-run REPORT 方向 2b-2）；V 量化须走 v_trans=true + FA 侧对齐路线。
     const bool use_non_fa_deep_decode =
         (k->type == GGML_TYPE_F16 || ggml_is_quantized(k->type)) &&
         v->type == GGML_TYPE_F16 &&

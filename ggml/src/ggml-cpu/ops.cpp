@@ -372,7 +372,10 @@ static void ggml_compute_forward_dup_bytes(
     if (ggml_is_contiguous(dst)) {
         size_t id = 0;
         char * dst_ptr = (char *) dst->data;
-        const size_t rs = ne00 * type_size;
+        // engopt q8kv-non-fa-fullquant r1: 行宽改用 ggml_row_size（量化块感知）
+        // ——原 ne00 * type_size 假定 type_size=每元素宽，q8_0（34B/32 元素）
+        // 行宽算错 32x（3716cc01b 层面绕开的静默错拷本体）。f16 语义等价。
+        const size_t rs = ggml_row_size(src0->type, ne00);
 
         if (nb00 == type_size) {
             // src0 is contiguous on first dimension, copy by rows
@@ -388,14 +391,16 @@ static void ggml_compute_forward_dup_bytes(
                 }
             }
         } else {
-            //printf("%s: this is not optimal - fix me\n", __func__);
+            // 逐块拷贝：量化下 ne00 是元素数，拷贝原子是 type_size 字节的块
+            // （f16: blck=1、每元素一块，与原逐元素版严格等价）。
+            const int64_t nblk00 = ne00 / ggml_blck_size(src0->type);
 
             for (int64_t i03 = 0; i03 < ne03; i03++) {
                 for (int64_t i02 = 0; i02 < ne02; i02++) {
                     id += rs * ir0;
                     for (int64_t i01 = ir0; i01 < ir1; i01++) {
-                        for (int64_t i00 = 0; i00 < ne00; i00++) {
-                            const char * src0_ptr = (char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                        for (int64_t ib = 0; ib < nblk00; ib++) {
+                            const char * src0_ptr = (char *) src0->data + ib*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
                             memcpy(dst_ptr + id, src0_ptr, type_size);
 
                             id += type_size;
