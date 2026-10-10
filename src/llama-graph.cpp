@@ -43,7 +43,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
         (mctx->type_k() == GGML_TYPE_F16 || ggml_is_quantized(mctx->type_k())) &&
         mctx->type_v() == GGML_TYPE_F16 &&
         n_tokens/n_stream < 64 &&
-        n_kv >= 128;
+        (n_tokens/n_stream >= 2 || n_kv >= 128);
     const auto type = (cparams.flash_attn && !non_fa_decode) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
@@ -2575,11 +2575,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // [q8kv r1 否证] V 量化（v_trans=false + 非 FA 兜底 transpose）不可行：
     // 转置量化视图 ne0=n_kv 非 32 块对齐，dup/读取几何破裂（accept 0% + 4x 慢，
     // 见 night-run REPORT 方向 2b-2）；V 量化须走 v_trans=true + FA 侧对齐路线。
+    // engopt plookup-shallow-m64 r1: M>=2 时解除 n_kv>=128 下限——浅窗
+    // PLD verify 段也走非 FA（one_chunk 固定税在浅窗仍存在）；M==1 保持
+    // R5 原语义（浅窗 FA / 深窗非 FA），多序列每流 1 token 不受影响。
     const bool use_non_fa_deep_decode =
         (k->type == GGML_TYPE_F16 || ggml_is_quantized(k->type)) &&
         v->type == GGML_TYPE_F16 &&
         q->ne[2] / n_stream < 64 &&
-        k->ne[2] >= 128;
+        (q->ne[2] / n_stream >= 2 || k->ne[2] >= 128);
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
