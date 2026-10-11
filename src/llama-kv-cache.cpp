@@ -379,9 +379,13 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
-// [engopt r4 实验] SnapKV eviction——把 seq 的 KV 压缩到 keep_pos 集（详见 night-run 2026-10-11
-// notes-snapkv-design.md R4 节）：调度层给"保留 pos 列表"（R3 算法），引擎负责数据前移 + pos 重编号
-// （使 used_max_p1 = n_alive -> get_n_kv 视图收缩 -> 读量下降）。
+// [engopt r4 实验] SnapKV eviction——把 seq 的 KV 压缩到 keep 集（详见 night-run 2026-10-11
+// notes-snapkv-design.md R4 节）：调度层给"保留列表"（R3 算法），引擎负责数据前移至
+// 0..n_alive-1（视图收缩经 get_n_kv 的"槽跨度"语义自动获得）。
+// [路线 B] pos 保真：不做 pos 重编号（快照原样写回）——RoPE 位置语义完好（模型见"稀疏历史"
+// 而非"压缩时间轴"）；无 k_shift 触发。对照路线 A（重编号 + k_shift 补偿）。
+// 协议：keep_pos 在本实现中语义为"升序槽索引数组"（与观测张量的槽序空间一致；
+// 保 pos 后槽≠pos，故不能用 pos 寻址）。
 // 实验限定：非量化 KV、单序列（多 seq 共享槽时返回 0）。
 uint32_t llama_kv_cache::evict_keep(llama_seq_id seq_id, const llama_pos * keep_pos, size_t n_keep) {
     if (other) {
@@ -400,24 +404,20 @@ uint32_t llama_kv_cache::evict_keep(llama_seq_id seq_id, const llama_pos * keep_
         return it != keep_pos + n_keep && *it == p;
     };
 
-    // 收集保留槽（本 seq 且 pos ∈ keep）
+    // 收集保留槽（本 seq 且"槽索引 ∈ keep"——keep 为升序槽索引数组，与观测空间同序；
+    // 收集序即槽号升序，新槽序 j = 收集序——驱动侧投影 d_new[j]=d_old[keep[j]] 自动对齐）
     std::vector<uint32_t> alive;
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
             continue;
         }
-        if (in_keep(cells.pos_get(i))) {
+        if (in_keep((llama_pos) i)) {
             alive.push_back(i);
         }
     }
     if (alive.empty()) {
         return 0;
     }
-
-    // 按原 pos 升序（新 pos = 秩）
-    std::sort(alive.begin(), alive.end(), [&](uint32_t a, uint32_t b) {
-        return cells.pos_get(a) < cells.pos_get(b);
-    });
     const uint32_t n_alive = (uint32_t) alive.size();
 
     // 数据前移：dst 槽 j <- src 槽 alive[j]（dst <= src，j 递增安全；K/V 存储 = [n_embd, kv_size]，pos = ne[1]）
@@ -454,12 +454,9 @@ uint32_t llama_kv_cache::evict_keep(llama_seq_id seq_id, const llama_pos * keep_
         }
     }
     for (uint32_t j = 0; j < n_alive; ++j) {
+        // [路线 B] 保 pos：快照原样写回（含原绝对 pos 与 seq 集合）——不重编号，
+        // RoPE 位置语义完好；视图收缩由 get_n_kv 的槽语义自动获得（数据已紧凑）。
         cells.set(std::vector<uint32_t>{ j }, snap[j]);
-        // 非空槽改 pos 必须用 pos_add（维护 seq_pos 索引；pos_set 仅限空槽）
-        const llama_pos old_pos = cells.pos_get(j);
-        if (old_pos != (llama_pos) j) {
-            cells.pos_add(j, (llama_pos) j - old_pos);
-        }
     }
 
     v_heads[s] = 0;   // 保守：下次分配从头扫描空槽

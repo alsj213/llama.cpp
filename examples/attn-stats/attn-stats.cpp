@@ -171,18 +171,27 @@ int main(int argc, char ** argv) {
             break;
         }
         if (evict_w > 0 && (i + 1) % evict_w == 0) {
-            // 真值空间（消除手推错位）：cur_pos = 该 seq 最大 pos + 1（公共 API）
-            const llama_pos cur_pos = (llama_pos) llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
-            if (cur_pos <= 32) {
+            // 保留集的索引域 = 观测空间的"槽数"（[路线 B] 保 pos 后槽 ≠ pos；用最后一步
+            // 分布的后沿（非零末位）作为有效槽数，与引擎的槽空间对齐）
+            int64_t slots = 0;
+            if (!ud.step_dist.empty()) {
+                const auto & d = ud.step_dist.back();
+                int64_t q = (int64_t) d.size() - 1;
+                while (q >= 0 && d[q] <= 0.0) {
+                    q--;
+                }
+                slots = q + 1;
+            }
+            if (slots <= 32) {
                 continue;
             }
-            std::vector<llama_pos> keep = calc_keep(ud.step_dist, cur_pos, evict_keep_frac, evict_rec, evict_w);
+            std::vector<llama_pos> keep = calc_keep(ud.step_dist, slots, evict_keep_frac, evict_rec, evict_w);
             const int64_t t_ev0 = ggml_time_us();
             const uint32_t n_alive = llama_memory_evict_keep(llama_get_memory(ctx), 0, keep.data(), keep.size());
             const int64_t t_ev1 = ggml_time_us();
             n_evict++;
-            LOG_INF("%s : evict #%lld at step %d: cur_pos %d keep %zu -> n_alive %u (keep %.0f%% + rec%lld) took %.1f ms\n",
-                    __func__, (long long) n_evict, i + 1, (int) cur_pos, keep.size(), n_alive, evict_keep_frac * 100.0,
+            LOG_INF("%s : evict #%lld at step %d: slots %d keep %zu -> n_alive %u (keep %.0f%% + rec%lld) took %.1f ms\n",
+                    __func__, (long long) n_evict, i + 1, (int) slots, keep.size(), n_alive, evict_keep_frac * 100.0,
                     (long long) evict_rec, (t_ev1 - t_ev0) / 1000.0);
             // 观测空间同步压缩（历史重要性随 KV 一起投影到新 pos 空间）
             for (auto & d : ud.step_dist) {
