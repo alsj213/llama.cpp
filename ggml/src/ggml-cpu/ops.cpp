@@ -8911,7 +8911,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    GGML_ASSERT(k->type == v->type);
+    // 2b-3: quantized K (with f16 V) is also admitted — the kernel dequantizes
+    // K to the f16 K_h buffer at tile-load time (requires the fp16 GEMM channel).
+    GGML_ASSERT(k->type == v->type || (ggml_is_quantized(k->type) && v->type == GGML_TYPE_F16));
     const ggml_type kv_type = k->type;
 
 
@@ -8954,7 +8956,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     // path, and fp16 accumulation of KQ scores is upstream-consistent
     // (one_chunk's GGML_F16_VEC vfmaq_f16). Falls back to the f32 channel
     // on cores/compile targets without fullfp16.
-    const bool use_gemm_f16 = (kv_type == GGML_TYPE_F16);
+    // [2b-3] quantized K dequantizes to f16 (K_h) at tile-load time and rides
+    // this same channel; V must be f16 in that combination.
+    const bool use_gemm_f16 = (kv_type == GGML_TYPE_F16 || ggml_is_quantized(kv_type)) && v->type == GGML_TYPE_F16;
+    GGML_ASSERT(!ggml_is_quantized(kv_type) || ggml_blck_size(kv_type) <= 256);
 #else
     const bool use_gemm_f16 = false;
 #endif
@@ -9162,7 +9167,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             int tk = 0;
 #ifdef GGML_SIMD_GEMM_F16
-            if (use_gemm_f16 && DK % 8 == 0) {
+            // [2b-3] the 8x8 block-transpose reads native f16 — quantized K takes
+            // the scalar dequant path below instead
+            if (use_gemm_f16 && kv_type == GGML_TYPE_F16 && DK % 8 == 0) {
                 // fp16 channel: block-transpose in 8x8 f16 blocks (3-stage vtrn:
                 // 16/32/64-bit granularity, 24 instrs per 64 elems, contiguous
                 // stores). The scalar path scattered 2-byte stores 128B apart
@@ -9204,7 +9211,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 #endif
             for (; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                if (use_gemm_f16) {
+                if (use_gemm_f16 && ggml_is_quantized(kv_type)) {
+                    // [2b-3] quantized K: dequantize the row to f32 (chunked,
+                    // block-aligned), convert to f16, store transposed into K_h.
+                    // Once per KV position per tile — amortized over Q_TILE_SZ queries.
+                    const auto *   k_traits = ggml_get_type_traits(kv_type);
+                    const int64_t  k_blck   = ggml_blck_size(kv_type);
+                    const int64_t  k_chunk  = 256 - (256 % k_blck);
+                    float k_row_f32[256];
+                    for (int64_t dk0 = 0; dk0 < DK; dk0 += k_chunk) {
+                        const int64_t n = MIN(k_chunk, DK - dk0);
+                        k_traits->to_float(k_data + (dk0/k_blck)*ggml_type_size(kv_type), k_row_f32, n);
+                        for (int64_t j = 0; j < n; j++) {
+                            K_h[(dk0 + j)*KV_TILE_SZ + tk] = GGML_CPU_FP32_TO_FP16(k_row_f32[j]);
+                        }
+                    }
+                } else if (use_gemm_f16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_h[dk * KV_TILE_SZ + tk] = k_f16[dk];
@@ -9360,7 +9382,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
                 if (use_gemm_f16) {
                     memcpy(V_h + tk * DV, v_data, DV * sizeof(ggml_fp16_t));
-                } else if (kv_type == GGML_TYPE_F16) {
+                } else if (v->type == GGML_TYPE_F16) {
                     ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
                 } else {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
@@ -9634,10 +9656,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+        // [2b-3] quantized K + f16 V also rides the tiled path (K is dequantized
+        // to f16 inside the kernel). Requires the fp16 GEMM channel.
+        const bool quant_k_ok =
+#ifdef GGML_SIMD_GEMM_F16
+            ggml_is_quantized(k->type) && v->type == GGML_TYPE_F16;
+#else
+            false;
+#endif
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
-                                kv_is_f32_or_f16 &&
-                                k->type == v->type &&
+                                (kv_is_f32_or_f16 || quant_k_ok) &&
+                                (k->type == v->type || quant_k_ok) &&
                                 neq1 >= Q_TILE_SZ);
 #ifdef GGML_SIMD
 #if defined(__ARM_FEATURE_SVE)
