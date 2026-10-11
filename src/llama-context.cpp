@@ -229,6 +229,18 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // engopt: 小 M（M<64）非 FA 路由为 CPU 专属优化——仅当全部设备为 CPU（无 GPU/IGPU/ACCEL
+    // 参与）时启用（该优化的有效性源于 CPU FA kernel 的 tile 空转/固定税；GPU 上融合 kernel
+    // 更优且涉及 KV 布局耦合——见 mobile-bench docs/notes-upstream-candidates.md
+    // "候选 1 附：跨后端适用性"）。其他后端保持上游 FA 原逻辑。
+    cparams.cpu_non_fa_decode = true;
+    for (const auto & ld : model.devices) {
+        if (ggml_backend_dev_type(ld.dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            cparams.cpu_non_fa_decode = false;
+            break;
+        }
+    }
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;

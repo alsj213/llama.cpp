@@ -39,6 +39,7 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool cpu_non_fa_decode = false;  // engopt: 纯 CPU 后端——启用小 M（M<64）非 FA 路由（其他后端保持上游 FA 逻辑）
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

@@ -39,7 +39,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // 的 use_non_fa_deep_decode 判定严格一致：f16 KV、M<64 且 n_kv≥128 → 非 FA
     // 链（f32 掩码）；其余（prefill/浅 KV）走 FA（f16 掩码）。
     // （r1 扩门：M==1 → M<64，与 build_attn_mha 同步。）
+    // （cpu 门：仅纯 CPU 后端启用——GPU/NPU 保持上游 FA 逻辑，见 notes-upstream-candidates.md。）
     const bool non_fa_decode =
+        cparams.cpu_non_fa_decode &&
         (mctx->type_k() == GGML_TYPE_F16 || ggml_is_quantized(mctx->type_k())) &&
         mctx->type_v() == GGML_TYPE_F16 &&
         n_tokens/n_stream < 64 &&
@@ -2578,7 +2580,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // engopt plookup-shallow-m64 r1: M>=2 时解除 n_kv>=128 下限——浅窗
     // PLD verify 段也走非 FA（one_chunk 固定税在浅窗仍存在）；M==1 保持
     // R5 原语义（浅窗 FA / 深窗非 FA），多序列每流 1 token 不受影响。
+    // （cpu 门：仅纯 CPU 后端启用——GPU/NPU 保持上游 FA 逻辑。）
     const bool use_non_fa_deep_decode =
+        cparams.cpu_non_fa_decode &&
         (k->type == GGML_TYPE_F16 || ggml_is_quantized(k->type)) &&
         v->type == GGML_TYPE_F16 &&
         q->ne[2] / n_stream < 64 &&
