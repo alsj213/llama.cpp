@@ -599,6 +599,29 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
     return sum;
 }
 
+// exp(x - max) with the result landing in f16 directly: same math as
+// ggml_vec_soft_max_f32, but the output store is fused with the f32->f16
+// convert — used by the flash-attn tiled fp16 channel to skip a full
+// KQ f32 write + re-read round-trip per tile. Non-ARM targets fall back
+// to scalar (the f16 channel only engages on fullfp16 aarch64 anyway).
+ggml_float ggml_vec_soft_max_f32_f16(const int n, ggml_fp16_t * y, const float * x, float max) {
+    int i = 0;
+    ggml_float sum = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    for (; i + 3 < n; i += 4) {
+        float32x4_t val = ggml_v_expf(vsubq_f32(vld1q_f32(x + i), vdupq_n_f32(max)));
+        vst1_f16((__fp16 *)(y + i), vcvt_f16_f32(val));
+        sum += (ggml_float)vaddvq_f32(val);
+    }
+#endif
+    for (; i < n; ++i) {
+        float val = expf(x[i] - max);
+        sum += (ggml_float)val;
+        y[i] = GGML_FP32_TO_FP16(val);
+    }
+    return sum;
+}
+
 ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max) {
     // log(soft_max) = log(soft_max_i / soft_max_sum) = log(soft_max_i) - log(soft_max_sum) = (logit_i - max) - log(soft_max_i)
 

@@ -35,8 +35,18 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // engopt kv-decode-deep r5: 掩码类型跟随本图实际注意力链——与 build_attn_mha
+    // 的 use_non_fa_deep_decode 判定严格一致：f16 KV、M<64 且 n_kv≥128 → 非 FA
+    // 链（f32 掩码）；其余（prefill/浅 KV）走 FA（f16 掩码）。
+    // （r1 扩门：M==1 → M<64，与 build_attn_mha 同步。）
+    // （cpu 门：仅纯 CPU 后端启用——GPU/NPU 保持上游 FA 逻辑，见 notes-upstream-candidates.md。）
+    const bool non_fa_decode =
+        cparams.cpu_non_fa_decode &&
+        (mctx->type_k() == GGML_TYPE_F16 || ggml_is_quantized(mctx->type_k())) &&
+        mctx->type_v() == GGML_TYPE_F16 &&
+        n_tokens/n_stream < 64 &&
+        (n_tokens/n_stream >= 2 || n_kv >= 128);
+    const auto type = (cparams.flash_attn && !non_fa_decode) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
@@ -2552,6 +2562,32 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
+    // engopt kv-decode-deep r5: 深 KV 的单 token decode 改走非 FA 链（mul_mat/
+    // tinyBLAS 块式 gemm；实测 t4 d4096 6.66→15.6 t/s）。n_kv<128 的浅 decode 与
+    // prefill 保持 FA（d0 型短生成零变化；tg512 起非 FA 实测 +7.2%）。
+    // KV 视图维度（llama-kv-cache.cpp:get_k）：ne = [dk, kv_heads, n_kv, stream]。
+    // engopt plookup-verify-batch r1: M==1 扩到 M<64——FA 对 neq1<Q_TILE(64) 落
+    // one_chunk 慢路径（实测 PLD verify batch 每步 ~210ms 固定税，nd1=6.6x 单
+    // token 步）；非 FA 链走 mul_mat(V)，对任意 M 天然 batch 复用（KV 读一次 +
+    // gemm M 行）。M>=64 留给 tiled FA（neq1>=Q_TILE 即启用），互补不重叠。
+    // engopt q8k-non-fa-verify r1: K 维度放开量化（q8_0 等）——量化 K 的
+    // kv 视图由 get_k 以 ggml_row_size 构造（块感知），非 FA 的 mul_mat
+    // (q8_0 K x f32 q) 是标准 vec_dot；V 保 f16（量化 V 的布局/dup 面未开，
+    // 见 3716cc01b 与 dup_bytes 行宽问题）。f16 子集行为不变。
+    // [q8kv r1 否证] V 量化（v_trans=false + 非 FA 兜底 transpose）不可行：
+    // 转置量化视图 ne0=n_kv 非 32 块对齐，dup/读取几何破裂（accept 0% + 4x 慢，
+    // 见 night-run REPORT 方向 2b-2）；V 量化须走 v_trans=true + FA 侧对齐路线。
+    // engopt plookup-shallow-m64 r1: M>=2 时解除 n_kv>=128 下限——浅窗
+    // PLD verify 段也走非 FA（one_chunk 固定税在浅窗仍存在）；M==1 保持
+    // R5 原语义（浅窗 FA / 深窗非 FA），多序列每流 1 token 不受影响。
+    // （cpu 门：仅纯 CPU 后端启用——GPU/NPU 保持上游 FA 逻辑。）
+    const bool use_non_fa_deep_decode =
+        cparams.cpu_non_fa_decode &&
+        (k->type == GGML_TYPE_F16 || ggml_is_quantized(k->type)) &&
+        v->type == GGML_TYPE_F16 &&
+        q->ne[2] / n_stream < 64 &&
+        (q->ne[2] / n_stream >= 2 || k->ne[2] >= 128);
+
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
@@ -2560,12 +2596,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !use_non_fa_deep_decode;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
         if (v_trans) {
-            v = ggml_transpose(ctx0, v);
+            // engopt kv-decode-deep r5: 缓存为转置（非 FA）布局时，FA 需物化
+            // [dv, n_kv, heads]（每 batch 每层一次 repack，摊薄到整个 batch；
+            // 裸 transpose 视图首维步长 ≠ 元素大小，过不了 FA op 入口断言）。
+            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)

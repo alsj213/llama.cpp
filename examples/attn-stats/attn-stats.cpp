@@ -1,0 +1,339 @@
+// SnapKV R1 原型：观测非 FA attention 链的 kq softmax 分布
+// （GGML_OP_SOFT_MAX 节点仅由非 FA 链产生——FA 是融合 op，无独立 softmax）
+// 用途：验证"重要性长尾"前提（SnapKV 类 KV 压缩的可行性判据）
+// 用法示例：llama-attn-stats -m model.gguf -f prompt.txt -c 4096 -b 4096 -n 64 -t 4
+
+#include "arg.h"
+#include "common.h"
+#include "log.h"
+#include "sampling.h"
+#include "llama.h"
+
+#include <algorithm>
+#include <clocale>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <string>
+#include <vector>
+
+// [R4] eviction 保留集：最近 W 步窗口累计的 top-keep_frac ∪ recency（末尾 recency 位），升序 pos
+static std::vector<llama_pos> calc_keep(const std::vector<std::vector<double>> & step_dist,
+                                        int64_t cur_pos, double keep_frac, int64_t recency,
+                                        int64_t window) {
+    std::vector<llama_pos> keep;
+    if (cur_pos <= 0) {
+        return keep;
+    }
+    const int64_t W = std::min<int64_t>(window, (int64_t) step_dist.size());
+    std::vector<double> win((size_t) cur_pos, 0.0);
+    for (int64_t u = (int64_t) step_dist.size() - W; u < (int64_t) step_dist.size(); ++u) {
+        const auto & d = step_dist[u];
+        const int64_t m = std::min<int64_t>(cur_pos, (int64_t) d.size());
+        for (int64_t i = 0; i < m; i++) {
+            win[i] += d[i];
+        }
+    }
+    const int64_t k = std::max<int64_t>(1, (int64_t) (cur_pos * keep_frac));
+    std::vector<int64_t> idx((size_t) cur_pos);
+    for (int64_t i = 0; i < cur_pos; i++) {
+        idx[i] = i;
+    }
+    std::sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return win[a] > win[b]; });
+    std::vector<char> sel((size_t) cur_pos, 0);
+    for (int64_t i = 0; i < k; i++) {
+        sel[idx[i]] = 1;
+    }
+    for (int64_t i = std::max<int64_t>(0, cur_pos - recency); i < cur_pos; i++) {
+        sel[i] = 1;
+    }
+    for (int64_t i = 0; i < cur_pos; i++) {
+        if (sel[i]) {
+            keep.push_back((llama_pos) i);
+        }
+    }
+    return keep;   // 升序
+}
+
+struct attn_stats {
+    std::vector<double> acc;   // [n_kv] 全局累计（跨层/步/head）
+    std::vector<std::vector<double>> step_dist;   // [step] -> [pos]，该步分布（层/head 合并）
+    int64_t n_captured = 0;
+    int64_t n_kv_max   = 0;
+};
+
+static bool attn_stats_cb(struct ggml_tensor * t, bool ask, void * ud_) {
+    auto * ud = (attn_stats *) ud_;
+
+    if (ask) {
+        return t->op == GGML_OP_SOFT_MAX;
+    }
+
+    const int64_t n_kv = t->ne[0];
+    const int64_t n_q  = t->ne[1];
+
+    std::vector<float> buf(ggml_nelements(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+
+    if ((int64_t) ud->acc.size() < n_kv) {
+        ud->acc.resize(n_kv, 0.0);
+    }
+    if (ud->step_dist.empty()) {
+        ud->step_dist.push_back({});
+    }
+    auto & sd = ud->step_dist.back();
+    if ((int64_t) sd.size() < n_kv) {
+        sd.resize(n_kv, 0.0);
+    }
+
+    const float * p = buf.data();
+    for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+            for (int64_t q = 0; q < n_q; q++) {
+                for (int64_t i = 0; i < n_kv; i++) {
+                    ud->acc[i] += p[i];
+                    sd[i]      += p[i];
+                }
+                p += n_kv;
+            }
+        }
+    }
+
+    ud->n_captured++;
+    ud->n_kv_max = std::max(ud->n_kv_max, n_kv);
+    return true;
+}
+
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    common_params params;
+    common_init();
+
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+        return 1;
+    }
+
+    attn_stats ud;
+    params.cb_eval = attn_stats_cb;
+    params.cb_eval_user_data = &ud;
+    params.warmup = false;
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    auto llama_init = common_init_from_params(params);
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
+    if (model == nullptr || ctx == nullptr) {
+        LOG_ERR("%s : failed to init\n", __func__);
+        return 1;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+    if (tokens.empty()) {
+        LOG_ERR("%s : no input tokens\n", __func__);
+        return 1;
+    }
+    LOG_INF("%s: prompt tokens = %zu\n", __func__, tokens.size());
+
+    // prefill（大 M 走 FA，无观测）
+    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
+        LOG_ERR("%s : prefill failed\n", __func__);
+        return 1;
+    }
+
+    // [R4] eviction 实验开关（env）：LLAMA_SNAPKV_W=每 N 步 evict（0=关）；LLAMA_SNAPKV_KEEP=保留比例
+    int64_t evict_w = 0;
+    double  evict_keep_frac = 0.25;
+    int64_t evict_rec = 16;
+    if (const char * e = getenv("LLAMA_SNAPKV_W"))    { evict_w = atoll(e); }
+    if (const char * e = getenv("LLAMA_SNAPKV_KEEP")) { evict_keep_frac = atof(e); }
+    if (const char * e = getenv("LLAMA_SNAPKV_REC"))  { evict_rec = atoll(e); }
+    int64_t n_evict = 0;
+
+    // 逐 token 解码（M=1，深 KV → 非 FA 链被观测）
+    struct common_sampler * smpl = common_sampler_init(model, params.sampling);
+    const int n_gen = params.n_predict > 0 ? params.n_predict : 64;
+    std::string gen;
+    for (int i = 0; i < n_gen; i++) {
+        llama_token id = common_sampler_sample(smpl, ctx, -1);
+        common_sampler_accept(smpl, id, true);
+        gen += common_token_to_piece(ctx, id);
+        if (llama_vocab_is_eog(vocab, id)) {
+            break;
+        }
+        ud.step_dist.push_back({});
+        if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
+            LOG_ERR("%s : decode failed at step %d\n", __func__, i);
+            break;
+        }
+        if (evict_w > 0 && (i + 1) % evict_w == 0) {
+            // 保留集的索引域 = 观测空间的"槽数"（[路线 B] 保 pos 后槽 ≠ pos；用最后一步
+            // 分布的后沿（非零末位）作为有效槽数，与引擎的槽空间对齐）
+            int64_t slots = 0;
+            if (!ud.step_dist.empty()) {
+                const auto & d = ud.step_dist.back();
+                int64_t q = (int64_t) d.size() - 1;
+                while (q >= 0 && d[q] <= 0.0) {
+                    q--;
+                }
+                slots = q + 1;
+            }
+            if (slots <= 32) {
+                continue;
+            }
+            std::vector<llama_pos> keep = calc_keep(ud.step_dist, slots, evict_keep_frac, evict_rec, evict_w);
+            const int64_t t_ev0 = ggml_time_us();
+            const uint32_t n_alive = llama_memory_evict_keep(llama_get_memory(ctx), 0, keep.data(), keep.size());
+            const int64_t t_ev1 = ggml_time_us();
+            n_evict++;
+            LOG_INF("%s : evict #%lld at step %d: slots %d keep %zu -> n_alive %u (keep %.0f%% + rec%lld) took %.1f ms\n",
+                    __func__, (long long) n_evict, i + 1, (int) slots, keep.size(), n_alive, evict_keep_frac * 100.0,
+                    (long long) evict_rec, (t_ev1 - t_ev0) / 1000.0);
+            // 观测空间同步压缩（历史重要性随 KV 一起投影到新 pos 空间）
+            for (auto & d : ud.step_dist) {
+                std::vector<double> nd;
+                nd.reserve(keep.size());
+                for (llama_pos p : keep) {
+                    nd.push_back(p < (llama_pos) d.size() ? d[(size_t) p] : 0.0);
+                }
+                d = std::move(nd);
+            }
+            // 后续自动 pos = seq_pos_max+1 = n_alive（llama-batch.cpp:103）
+        }
+    }
+    common_sampler_free(smpl);
+    LOG_INF("%s : evictions = %lld, gen len = %zu\n",
+            __func__, (long long) n_evict, gen.size());
+
+    LOG_INF("%s: gen: %s\n", __func__, gen.c_str());
+
+    // 统计输出
+    LOG_INF("\n=== attn stats ===\n");
+    LOG_INF("captured softmax evals = %lld, n_kv_max = %lld\n",
+            (long long) ud.n_captured, (long long) ud.n_kv_max);
+
+    if (ud.n_captured > 0 && !ud.acc.empty()) {
+        std::vector<double> v = ud.acc;
+        double total = 0.0;
+        for (double x : v) total += x;
+        std::sort(v.begin(), v.end(), std::greater<double>());
+        const int64_t n = (int64_t) v.size();
+        LOG_INF("positions = %lld, total mass = %.3f\n", (long long) n, total);
+        for (double pct : {1.0, 5.0, 10.0, 25.0, 50.0}) {
+            int64_t k = std::max<int64_t>(1, (int64_t) (n * pct / 100.0));
+            double s = 0.0;
+            for (int64_t i = 0; i < k; i++) s += v[i];
+            LOG_INF("top %5.1f%% (%6lld pos): mass share = %.4f\n",
+                    pct, (long long) k, total > 0 ? s / total : 0.0);
+        }
+    }
+
+    // R2：因果版——观察窗（前 s 步）选出的 top-25% 位置，在未来（s..end）同域内的质量保留
+    {
+        const int64_t n_steps = (int64_t) ud.step_dist.size();
+        LOG_INF("\n=== window prediction (causal) ===\n");
+        for (int64_t s : { (int64_t) 16, (int64_t) 32, (int64_t) 48 }) {
+            if (s >= n_steps) {
+                continue;
+            }
+            std::vector<double> obs, fut;
+            for (int64_t t = 0; t < s; t++) {
+                const auto & d = ud.step_dist[t];
+                if ((int64_t) obs.size() < (int64_t) d.size()) obs.resize(d.size(), 0.0);
+                for (size_t i = 0; i < d.size(); i++) obs[i] += d[i];
+            }
+            for (int64_t t = s; t < n_steps; t++) {
+                const auto & d = ud.step_dist[t];
+                if ((int64_t) fut.size() < (int64_t) d.size()) fut.resize(d.size(), 0.0);
+                for (size_t i = 0; i < d.size(); i++) fut[i] += d[i];
+            }
+            const int64_t n = (int64_t) obs.size();
+            const int64_t k = std::max<int64_t>(1, (int64_t) (n * 0.25));
+            std::vector<int64_t> idx(n);
+            for (int64_t i = 0; i < n; i++) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return obs[a] > obs[b]; });
+            std::vector<char> sel(n, 0);
+            for (int64_t i = 0; i < k; i++) sel[idx[i]] = 1;
+
+            const int64_t lim = std::min<int64_t>(n, (int64_t) fut.size());
+            double m_sel = 0.0, m_tot = 0.0;
+            for (int64_t i = 0; i < lim; i++) {
+                if (sel[i]) m_sel += fut[i];
+                m_tot += fut[i];
+            }
+            // oracle：未来同域内的 top-k 占比
+            std::vector<double> fv(fut.begin(), fut.begin() + lim);
+            std::sort(fv.begin(), fv.end(), std::greater<double>());
+            double fo = 0.0;
+            for (int64_t i = 0; i < std::min<int64_t>(k, lim); i++) fo += fv[i];
+
+            LOG_INF("obs=%lld steps, n=%lld: selected-25%% future-mass=%.4f | oracle-top25%%=%.4f\n",
+                    (long long) s, (long long) n,
+                    m_tot > 0 ? m_sel / m_tot : 0.0,
+                    m_tot > 0 ? fo / m_tot : 0.0);
+        }
+    }
+
+    // R3：滚动 eviction 模拟——每步用最近 W 步窗口重选 top-25%，叠加 recency 保留；
+    // 统计"被淘汰位置"在每步分布中的质量损失（工程版策略的每步损失率）。
+    {
+        const int64_t W = 16;
+        const double keep_frac = 0.25;
+        const int64_t n_steps = (int64_t) ud.step_dist.size();
+        double loss_sum = 0.0, mass_sum = 0.0;
+        int64_t n_eval = 0;
+        for (int64_t t = W; t < n_steps; t++) {
+            const auto & dt = ud.step_dist[t];
+            const int64_t n = (int64_t) dt.size();
+            // 有效末位（未来槽被 mask 为 0）
+            int64_t last = n - 1;
+            while (last > 0 && dt[last] <= 0.0) {
+                last--;
+            }
+            // 观察窗累计（最近 W 步）
+            std::vector<double> win(n, 0.0);
+            for (int64_t u = t - W; u < t; u++) {
+                const auto & du = ud.step_dist[u];
+                const int64_t m = std::min<int64_t>(n, (int64_t) du.size());
+                for (int64_t i = 0; i < m; i++) {
+                    win[i] += du[i];
+                }
+            }
+            const int64_t k = std::max<int64_t>(1, (int64_t) (n * keep_frac));
+            std::vector<int64_t> idx(n);
+            for (int64_t i = 0; i < n; i++) {
+                idx[i] = i;
+            }
+            std::sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return win[a] > win[b]; });
+            std::vector<char> keep(n, 0);
+            for (int64_t i = 0; i < k; i++) {
+                keep[idx[i]] = 1;
+            }
+            for (int64_t i = std::max<int64_t>(0, last - W + 1); i <= last; i++) {
+                keep[i] = 1;   // recency（最后 W 个有效位置）
+            }
+            double tot = 0.0, lost = 0.0;
+            for (int64_t i = 0; i <= last; i++) {
+                tot += dt[i];
+                if (!keep[i]) {
+                    lost += dt[i];
+                }
+            }
+            loss_sum += lost;
+            mass_sum += tot;
+            n_eval++;
+        }
+        LOG_INF("R3 rolling (W=%lld, keep=%.0f%% + recency): avg per-step lost mass = %.4f (over %lld steps)\n",
+                (long long) W, keep_frac * 100.0,
+                mass_sum > 0 ? loss_sum / mass_sum : 0.0, (long long) n_eval);
+    }
+
+    LOG("\n");
+    llama_perf_context_print(ctx);
+    llama_backend_free();
+    return 0;
+}

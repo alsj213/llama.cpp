@@ -224,3 +224,139 @@ static void simd_gemm(
 }
 
 #endif // GGML_SIMD
+
+// ---------------------------------------------------------------------------
+// F16 GEMM variant (NEON fullfp16): C[M x N] += A[M x K] * B[K x N], all fp16.
+// For the flash-attention tiled path on F16 KV: A77-class cores run 8-wide
+// fp16 FMA — and the fp16 numeric channel is what upstream's one_chunk path
+// already uses for KQ scores (GGML_F16_VEC vfmaq_f16 accumulation).
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#define GGML_SIMD_GEMM_F16 1
+
+// 4x4 accumulators x float16x8 + 4 B + 4 A-broadcast = 24 of 32 NEON regs.
+static constexpr int GEMM16_RM = 4;
+static constexpr int GEMM16_RN = 4;
+static constexpr int GEMM16_KN = 8;
+
+// Row pitches are explicit: the flash-attn tiled path also runs clipped
+// GEMMs, where the C/B/A row stride differs from N/K (the K tile / KQh are
+// packed with a KV_TILE_SZ pitch while N is the clipped column count).
+template <int RM, int RN>
+static inline void simd_gemm16_ukernel(
+    ggml_fp16_t       * GGML_RESTRICT C,
+    const ggml_fp16_t * GGML_RESTRICT A,
+    const ggml_fp16_t * GGML_RESTRICT B,
+    int K, int lda, int ldb, int ldc)
+{
+    float16x8_t acc[RM][RN];
+    for (int i = 0; i < RM; i++) {
+        for (int r = 0; r < RN; r++) {
+            acc[i][r] = vld1q_f16((const __fp16 *)(C + i * ldc + r * GEMM16_KN));
+        }
+    }
+
+    for (int kk = 0; kk < K; kk++) {
+        float16x8_t Bv[RN];
+        for (int r = 0; r < RN; r++) {
+            Bv[r] = vld1q_f16((const __fp16 *)(B + kk * ldb + r * GEMM16_KN));
+        }
+        float16x8_t av[RM];
+        for (int i = 0; i < RM; i++) {
+            av[i] = vdupq_n_f16(*(const __fp16 *)(A + i * lda + kk));
+        }
+        for (int i = 0; i < RM; i++) {
+            for (int r = 0; r < RN; r++) {
+                acc[i][r] = vfmaq_f16(acc[i][r], Bv[r], av[i]);
+            }
+        }
+    }
+
+    for (int i = 0; i < RM; i++) {
+        for (int r = 0; r < RN; r++) {
+            vst1q_f16((__fp16 *)(C + i * ldc + r * GEMM16_KN), acc[i][r]);
+        }
+    }
+}
+
+// C[M x N] += A[M x K] * B[K x N]   (all fp16)
+// lda/ldb/ldc are the A/B/C row pitches in elements; <= 0 selects the dense
+// pitch (K/N/N), which is what every dense caller wants.
+static void simd_gemm_f16(
+    ggml_fp16_t       * GGML_RESTRICT C,
+    const ggml_fp16_t * GGML_RESTRICT A,
+    const ggml_fp16_t * GGML_RESTRICT B,
+    int M, int K, int N, int lda = -1, int ldb = -1, int ldc = -1)
+{
+    if (lda <= 0) { lda = K; }
+    if (ldb <= 0) { ldb = N; }
+    if (ldc <= 0) { ldc = N; }
+
+    int64_t ii = 0;
+    for (; ii + GEMM16_RM <= M; ii += GEMM16_RM) {
+        int64_t jj = 0;
+        for (; jj + GEMM16_RN * GEMM16_KN <= N; jj += GEMM16_RN * GEMM16_KN) {
+            simd_gemm16_ukernel<GEMM16_RM, GEMM16_RN>(C + jj, A, B + jj, K, lda, ldb, ldc);
+        }
+        for (; jj + GEMM16_KN <= N; jj += GEMM16_KN) {
+            simd_gemm16_ukernel<GEMM16_RM, 1>(C + jj, A, B + jj, K, lda, ldb, ldc);
+        }
+        for (; jj < N; jj++) {
+            for (int i = 0; i < GEMM16_RM; i++) {
+                float a = GGML_FP16_TO_FP32(C[i * ldc + jj]);
+                for (int kk = 0; kk < K; kk++) {
+                    a += GGML_FP16_TO_FP32(A[i * lda + kk]) * GGML_FP16_TO_FP32(B[kk * ldb + jj]);
+                }
+                C[i * ldc + jj] = GGML_FP32_TO_FP16(a);
+            }
+        }
+
+        A += GEMM16_RM * lda;
+        C += GEMM16_RM * ldc;
+    }
+
+    // Tail rows: one at a time
+    for (; ii < M; ii++) {
+        int64_t jj = 0;
+        for (; jj + GEMM16_RN * GEMM16_KN <= N; jj += GEMM16_RN * GEMM16_KN) {
+            simd_gemm16_ukernel<1, GEMM16_RN>(C + jj, A, B + jj, K, lda, ldb, ldc);
+        }
+        for (; jj + GEMM16_KN <= N; jj += GEMM16_KN) {
+            simd_gemm16_ukernel<1, 1>(C + jj, A, B + jj, K, lda, ldb, ldc);
+        }
+        for (; jj < N; jj++) {
+            float a = GGML_FP16_TO_FP32(C[jj]);
+            for (int kk = 0; kk < K; kk++) {
+                a += GGML_FP16_TO_FP32(A[kk]) * GGML_FP16_TO_FP32(B[kk * ldb + jj]);
+            }
+            C[jj] = GGML_FP32_TO_FP16(a);
+        }
+
+        A += lda;
+        C += ldc;
+    }
+}
+#else
+// Scalar placeholder so simd_gemm_f16 always resolves at compile time.
+// It is dead code unless a target defines GGML_SIMD_GEMM_F16 (the tiled
+// flash-attn path gates on that macro, use_gemm_f16 stays false otherwise).
+static void simd_gemm_f16(
+    ggml_fp16_t       * GGML_RESTRICT C,
+    const ggml_fp16_t * GGML_RESTRICT A,
+    const ggml_fp16_t * GGML_RESTRICT B,
+    int M, int K, int N, int lda = -1, int ldb = -1, int ldc = -1)
+{
+    if (lda <= 0) { lda = K; }
+    if (ldb <= 0) { ldb = N; }
+    if (ldc <= 0) { ldc = N; }
+
+    for (int64_t i = 0; i < M; i++) {
+        for (int64_t j = 0; j < N; j++) {
+            float sum = GGML_FP16_TO_FP32(C[i * ldc + j]);
+            for (int64_t kk = 0; kk < K; kk++) {
+                sum += GGML_FP16_TO_FP32(A[i * lda + kk]) * GGML_FP16_TO_FP32(B[kk * ldb + j]);
+            }
+            C[i * ldc + j] = GGML_FP32_TO_FP16(sum);
+        }
+    }
+}
+#endif // __ARM_NEON && __ARM_FEATURE_FP16_VECTOR_ARITHMETIC

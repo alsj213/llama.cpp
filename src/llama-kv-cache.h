@@ -136,6 +136,10 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+
+    // [engopt r4 实验] SnapKV eviction：把 seq 的 KV 压缩到 keep_pos（升序）集，存活 pos 重编号为 [0, n_alive)；
+    // 仅非量化 KV；多 seq 共享槽未处理（返回 0）。返回存活数（0 = 未处理）
+    uint32_t evict_keep (llama_seq_id seq_id, const llama_pos * keep_pos, size_t n_keep) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
