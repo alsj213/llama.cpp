@@ -4318,6 +4318,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
         int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
 
+        // Cap the chunk height by the L1 footprint of the weight slice it streams.
+        //
+        // The gemm kernel consumes src1 in INTER_SIZE(=4)-token steps and re-scans the whole
+        // weight slice of its chunk for every step, i.e. nrows/4 times. The geometry above
+        // derives rows-per-chunk from the thread count alone, so the slice footprint grows
+        // with K and differs several-fold across nodes (q/k/v/o ~576 B/row vs down ~2520
+        // B/row) - with a fixed row count, the FFN slices end up well past L1d and every
+        // re-scan is served from L2. Bound the slice to L1_WEIGHT_BUDGET_BYTES instead and
+        // let nchunk0 grow to match; nchunk0 only ever grows here, so the NB_COLS alignment,
+        // the one-chunk-per-thread floor and the dynamic chunk claiming below are untouched.
+        {
+            // A77-class L1d is 64 KiB; leave room for the q8_K activation operand and the
+            // fp32 accumulator tile that share it.
+            constexpr int64_t L1_WEIGHT_BUDGET_BYTES = 32 * 1024;
+            const int64_t     row_bytes = (int64_t) nb01;  // bytes per weight row (= ggml_row_size(src0->type, ne00))
+            if (row_bytes > 0 && nr0 >= NB_COLS) {
+                int64_t dr0_max = (L1_WEIGHT_BUDGET_BYTES + row_bytes - 1) / row_bytes;  // budget expressed in rows
+                dr0_max = ((dr0_max + NB_COLS - 1) / NB_COLS) * NB_COLS;                 // round up to a whole NB_COLS group
+                dr0_max = MIN(dr0_max, (nr0 + nth - 1) / nth);                           // keep at least one chunk per thread
+                dr0_max = MAX(dr0_max, NB_COLS);                                         // never below the alignment floor
+                nchunk0 = MAX(nchunk0, (nr0 + dr0_max - 1) / dr0_max);
+            }
+        }
+
         // src1 is chunked only by full planes.
         // When we flatten we need to address dimensions not multiple of the q8 INTER_SIZE
         // to route them thorugh GEMV.
@@ -4344,6 +4368,45 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t max_nchunk = (nr0 + min_chunk_size - 1) / min_chunk_size;
         nchunk0                  = MIN(nchunk0, max_nchunk);
 
+        // Chunk the token dimension as well, so the weight-row chunking above does not multiply
+        // the activation traffic.
+        //
+        // Every chunk spans the whole src1 plane, so the quantized activation of the plane is
+        // re-read nchunk0 times per op. That buffer is ne11*ne00 bytes before quantization -
+        // 0.5 MB at K=1024 and 1.5 MB at K=3072 for a 512-token prefill, i.e. past A77-class L2
+        // (512 KiB) on its own - so with the L1-bounded weight slices in place those re-reads are
+        // what is left of the per-op traffic (nchunk0 x |A|, tens of MB per op).
+        //
+        // Splitting the token dimension too, and ordering the chunks row-slice-fast /
+        // token-block-slow, keeps one activation sub-block (|A|/nchunk_m <= 256 KiB) in L2 while
+        // all nchunk0 row slices of that token block consume it - including the slices claimed
+        // concurrently by neighbouring threads. The price is re-streaming the weight slices once
+        // per token block (nchunk_m x |W|), but those are already bounded to the L1 budget.
+        //
+        // nrows must stay a multiple of 4 so that one_chunk never falls into its gemv tail loop;
+        // dr1 is 4-aligned and, since this only triggers when ne11 % 4 == 0, every token block is
+        // too. A non-multiple-of-4 ne11, or an activation plane that already fits the budget,
+        // keeps the flat single-token-block geometry (in particular decode and the small kv/o
+        // ops are untouched).
+        int64_t nchunk_m = 1;
+        int64_t dr1      = ne11;
+        {
+            constexpr int64_t L2_ACT_BUDGET_BYTES = 256 * 1024;
+            constexpr int64_t MIN_TOKEN_CHUNK     = 64;
+            const int64_t     act_bytes           = (int64_t) ne11 * ne00;
+            if (ne11 % 4 == 0 && act_bytes > L2_ACT_BUDGET_BYTES) {
+                const int64_t nm = (act_bytes + L2_ACT_BUDGET_BYTES - 1) / L2_ACT_BUDGET_BYTES;
+                int64_t       d  = (ne11 + nm - 1) / nm;
+                d                = ((d + 3) / 4) * 4;    // nrows must remain a multiple of 4
+                d                = MAX(d, MIN_TOKEN_CHUNK);
+                d                = MIN(d, ne11);
+                if (d < ne11) {
+                    dr1      = d;
+                    nchunk_m = (ne11 + dr1 - 1) / dr1;   // derives from dr1: no empty token block
+                }
+            }
+        }
+
         if (ith == 0) {
             // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
             ggml_threadpool_chunk_set(params->threadpool, nth);
@@ -4354,16 +4417,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
 
-        while (current_chunk < nchunk0 * nchunk1) {
-            const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
+        const int64_t nchunk0m = nchunk0 * nchunk_m;
+
+        while (current_chunk < nchunk0m * nchunk1) {
+            const int64_t ith0 = current_chunk % nchunk0;              // weight-row slice (fastest)
+            const int64_t ithm = (current_chunk / nchunk0) % nchunk_m; // token block
+            const int64_t ith1 = current_chunk / nchunk0m;             // plane (slowest)
 
             int64_t src0_start = dr0 * ith0;
             int64_t src0_end   = MIN(src0_start + dr0, nr0);
 
-            // full-plane range for src1
-            int64_t src1_start = ith1 * ne11;
-            int64_t src1_end = (ith1 + 1) * ne11;
+            // token sub-range of the full plane; ithm < nchunk_m keeps it non-empty
+            const int64_t src1_plane = ith1 * ne11;
+            int64_t       src1_start = src1_plane + ithm * dr1;
+            int64_t       src1_end   = MIN(src1_start + dr1, src1_plane + ne11);
 
             // Align boundaries to NB_COLS - round up to ensure all data is included
             // The chunk size limiting above ensures chunks are large enough to prevent overlaps
