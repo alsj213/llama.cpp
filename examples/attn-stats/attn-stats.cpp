@@ -177,10 +177,13 @@ int main(int argc, char ** argv) {
                 continue;
             }
             std::vector<llama_pos> keep = calc_keep(ud.step_dist, cur_pos, evict_keep_frac, evict_rec, evict_w);
+            const int64_t t_ev0 = ggml_time_us();
             const uint32_t n_alive = llama_memory_evict_keep(llama_get_memory(ctx), 0, keep.data(), keep.size());
+            const int64_t t_ev1 = ggml_time_us();
             n_evict++;
-            LOG_INF("%s : evict #%lld at step %d: cur_pos %d keep %zu -> n_alive %u (keep %.0f%% + rec16)\n",
-                    __func__, (long long) n_evict, i + 1, (int) cur_pos, keep.size(), n_alive, evict_keep_frac * 100.0);
+            LOG_INF("%s : evict #%lld at step %d: cur_pos %d keep %zu -> n_alive %u (keep %.0f%% + rec%lld) took %.1f ms\n",
+                    __func__, (long long) n_evict, i + 1, (int) cur_pos, keep.size(), n_alive, evict_keep_frac * 100.0,
+                    (long long) evict_rec, (t_ev1 - t_ev0) / 1000.0);
             // 观测空间同步压缩（历史重要性随 KV 一起投影到新 pos 空间）
             for (auto & d : ud.step_dist) {
                 std::vector<double> nd;
