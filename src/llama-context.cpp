@@ -4022,6 +4022,18 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     mem->clear(data);
 }
 
+uint32_t llama_memory_evict_keep(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+       const llama_pos * keep_pos,
+              size_t      n_keep) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->evict_keep(seq_id, keep_pos, n_keep);
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,

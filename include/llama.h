@@ -745,6 +745,14 @@ extern "C" {
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
+    // [engopt r4 实验] SnapKV eviction：把 seq 的 KV 压缩到 keep_pos（升序数组）集，存活 pos 重编号 [0, n_alive)。
+    // 实验限定：仅非量化 KV、seq 独占其 cells。返回存活数（0 = 未处理）
+    LLAMA_API uint32_t llama_memory_evict_keep(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+           const llama_pos * keep_pos,
+                  size_t      n_keep);
+
     LLAMA_API bool llama_memory_seq_rm(
             llama_memory_t mem,
               llama_seq_id seq_id,

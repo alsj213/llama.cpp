@@ -12,9 +12,48 @@
 #include <algorithm>
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
+
+// [R4] eviction 保留集：最近 W 步窗口累计的 top-keep_frac ∪ recency（末尾 recency 位），升序 pos
+static std::vector<llama_pos> calc_keep(const std::vector<std::vector<double>> & step_dist,
+                                        int64_t cur_pos, double keep_frac, int64_t recency,
+                                        int64_t window) {
+    std::vector<llama_pos> keep;
+    if (cur_pos <= 0) {
+        return keep;
+    }
+    const int64_t W = std::min<int64_t>(window, (int64_t) step_dist.size());
+    std::vector<double> win((size_t) cur_pos, 0.0);
+    for (int64_t u = (int64_t) step_dist.size() - W; u < (int64_t) step_dist.size(); ++u) {
+        const auto & d = step_dist[u];
+        const int64_t m = std::min<int64_t>(cur_pos, (int64_t) d.size());
+        for (int64_t i = 0; i < m; i++) {
+            win[i] += d[i];
+        }
+    }
+    const int64_t k = std::max<int64_t>(1, (int64_t) (cur_pos * keep_frac));
+    std::vector<int64_t> idx((size_t) cur_pos);
+    for (int64_t i = 0; i < cur_pos; i++) {
+        idx[i] = i;
+    }
+    std::sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return win[a] > win[b]; });
+    std::vector<char> sel((size_t) cur_pos, 0);
+    for (int64_t i = 0; i < k; i++) {
+        sel[idx[i]] = 1;
+    }
+    for (int64_t i = std::max<int64_t>(0, cur_pos - recency); i < cur_pos; i++) {
+        sel[i] = 1;
+    }
+    for (int64_t i = 0; i < cur_pos; i++) {
+        if (sel[i]) {
+            keep.push_back((llama_pos) i);
+        }
+    }
+    return keep;   // 升序
+}
 
 struct attn_stats {
     std::vector<double> acc;   // [n_kv] 全局累计（跨层/步/head）
@@ -106,6 +145,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // [R4] eviction 实验开关（env）：LLAMA_SNAPKV_W=每 N 步 evict（0=关）；LLAMA_SNAPKV_KEEP=保留比例
+    int64_t evict_w = 0;
+    double  evict_keep_frac = 0.25;
+    int64_t evict_rec = 16;
+    if (const char * e = getenv("LLAMA_SNAPKV_W"))    { evict_w = atoll(e); }
+    if (const char * e = getenv("LLAMA_SNAPKV_KEEP")) { evict_keep_frac = atof(e); }
+    if (const char * e = getenv("LLAMA_SNAPKV_REC"))  { evict_rec = atoll(e); }
+    int64_t n_evict = 0;
+
     // 逐 token 解码（M=1，深 KV → 非 FA 链被观测）
     struct common_sampler * smpl = common_sampler_init(model, params.sampling);
     const int n_gen = params.n_predict > 0 ? params.n_predict : 64;
@@ -122,8 +170,32 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s : decode failed at step %d\n", __func__, i);
             break;
         }
+        if (evict_w > 0 && (i + 1) % evict_w == 0) {
+            // 真值空间（消除手推错位）：cur_pos = 该 seq 最大 pos + 1（公共 API）
+            const llama_pos cur_pos = (llama_pos) llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            if (cur_pos <= 32) {
+                continue;
+            }
+            std::vector<llama_pos> keep = calc_keep(ud.step_dist, cur_pos, evict_keep_frac, evict_rec, evict_w);
+            const uint32_t n_alive = llama_memory_evict_keep(llama_get_memory(ctx), 0, keep.data(), keep.size());
+            n_evict++;
+            LOG_INF("%s : evict #%lld at step %d: cur_pos %d keep %zu -> n_alive %u (keep %.0f%% + rec16)\n",
+                    __func__, (long long) n_evict, i + 1, (int) cur_pos, keep.size(), n_alive, evict_keep_frac * 100.0);
+            // 观测空间同步压缩（历史重要性随 KV 一起投影到新 pos 空间）
+            for (auto & d : ud.step_dist) {
+                std::vector<double> nd;
+                nd.reserve(keep.size());
+                for (llama_pos p : keep) {
+                    nd.push_back(p < (llama_pos) d.size() ? d[(size_t) p] : 0.0);
+                }
+                d = std::move(nd);
+            }
+            // 后续自动 pos = seq_pos_max+1 = n_alive（llama-batch.cpp:103）
+        }
     }
     common_sampler_free(smpl);
+    LOG_INF("%s : evictions = %lld, gen len = %zu\n",
+            __func__, (long long) n_evict, gen.size());
 
     LOG_INF("%s: gen: %s\n", __func__, gen.c_str());
 
