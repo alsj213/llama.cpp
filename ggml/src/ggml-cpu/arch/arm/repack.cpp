@@ -227,7 +227,7 @@ void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
 #endif
 }
 
-#if defined(__ARM_NEON)
+#if defined(__aarch64__) && defined(__ARM_NEON)
 // iscale for one row of a super block; the first value attaining the max picks the sign
 static float ggml_quantize_mat_q8_K_iscale(const float * GGML_RESTRICT xrow) {
     float32x4_t amaxv0 = vdupq_n_f32(0.0f);
@@ -271,7 +271,7 @@ void ggml_quantize_mat_q8_K_4x4(const float * GGML_RESTRICT x, void * GGML_RESTR
 
     block_q8_Kx4 * GGML_RESTRICT y = (block_q8_Kx4 *) vy;
 
-#if defined(__ARM_NEON)
+#if defined(__aarch64__) && defined(__ARM_NEON)
     float iscale[4];
 
     for (int i = 0; i < nb; i++) {
@@ -332,7 +332,7 @@ void ggml_quantize_mat_q8_K_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
 
     block_q8_Kx4 * GGML_RESTRICT y = (block_q8_Kx4 *) vy;
 
-#if defined(__ARM_NEON)
+#if defined(__aarch64__) && defined(__ARM_NEON)
     float iscale[4];
 
     for (int i = 0; i < nb; i++) {
